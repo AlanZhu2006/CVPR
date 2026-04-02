@@ -1,0 +1,300 @@
+\documentclass[12pt]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{array}
+\geometry{a4paper,margin=1in}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{基于 TTT3R+ 的语义-几何双状态线性 SLAM 研究计划}
+\author{CVPR Final Project Proposal}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{研究目标、创新点与执行计划（摘要）}
+
+\subsection{总体目标}
+本项目的核心目标是在 TTT3R 工程底座上实现一个\textbf{语义-几何双状态线性 SLAM} 系统，在固定预算下同时优化三类能力：
+\begin{itemize}
+  \item 长时几何一致性（轨迹与结构稳定）；
+  \item 长时语义一致性（重访语义不漂移）；
+  \item 资源效率（时延、显存、状态容量可控）。
+\end{itemize}
+
+\subsection{主要创新点（对外可陈述）}
+本文创新不在“首次使用 TTT”，而在\textbf{在线状态机制设计}：
+\begin{enumerate}
+  \item \textbf{语义-几何双状态联合建模}：语义不再是后处理标签，而是与几何并行演化的可读写状态；
+  \item \textbf{不确定性门控写回}：由观测质量、几何残差与历史稳定度共同决定是否写回，抑制错误累积；
+  \item \textbf{事件触发压缩与重访恢复}：在预算约束下保持长期可用状态，平衡性能与开销；
+  \item \textbf{长时序联合评测口径}：同时报告几何、语义与系统预算指标，形成完整证据链。
+\end{enumerate}
+
+\subsection{现有方向与本项目定位}
+现有相关方向可分为三类：
+\begin{itemize}
+  \item \textbf{在线几何更新方向}（以 TTT3R/CUT3R 为代表）：擅长在线几何优化，但语义通常未进入状态主回路；
+  \item \textbf{长时压缩恢复方向}（以 MERG3R 思路为代表）：擅长长期状态管理，但未显式构建语义-几何联合门控；
+  \item \textbf{语义 SLAM 方向}（SemanticFusion/DynaSLAM 等）：强调语义与几何融合，但多数不以预算约束下的在线状态写回机制为核心。
+\end{itemize}
+本项目定位为三者的统一机制化扩展：在 TTT3R 可执行链路中落地双状态、门控和压缩恢复，而不是简单模块叠加。
+
+\subsection{执行计划与阶段交付}
+\begin{itemize}
+  \item \textbf{阶段 A（接口打通）}：完成双状态数据结构与推理链路改造，交付可运行原型；
+  \item \textbf{阶段 B（机制落地）}：实现门控写回、事件触发压缩与重访恢复，交付消融开关；
+  \item \textbf{阶段 C（系统评测）}：构建统一指标与预算曲线，交付完整实验表；
+  \item \textbf{阶段 D（论文化收敛）}：完成误差分析、可视化与可复现文档，交付投稿版本报告。
+\end{itemize}
+
+\section{项目目标与问题定义}
+
+\subsection{研究问题}
+本项目关注开放场景中的在线三维重建与定位问题：系统在连续观测流下，需要同时维持几何一致性与语义稳定性，并在重访场景时保持可恢复、可查询、可扩展的状态表示。我们将该问题表述为\textbf{语义-几何双状态线性 SLAM}：
+\begin{itemize}
+  \item 几何状态 $S_{geo}$ 负责位姿与结构的一致估计；
+  \item 语义状态 $S_{sem}$ 负责跨时刻语义记忆与重访保持；
+  \item 两类状态以统一门控策略执行增量写回，以避免错误语义长期污染全局状态。
+\end{itemize}
+
+\subsection{最终目标}
+我们期望在 TTT3R/CUT3R 可执行框架上，构建一个可复现、可消融、可度量的双状态原型系统，并回答以下研究问题：
+\begin{enumerate}
+  \item 语义状态是否能在几何精度基本不退化的前提下提升重访一致性？
+  \item 门控更新与事件触发压缩是否能提升长期稳定性与状态利用效率？
+  \item 双状态机制在预算受限条件下是否优于单状态基线？
+\end{enumerate}
+
+\subsection{验收标准}
+\begin{table}[h]
+\centering
+\caption{项目验收标准}
+\begin{tabular}{p{0.23\linewidth}p{0.30\linewidth}p{0.35\linewidth}}
+\toprule
+维度 & 指标 & 目标 \\
+\midrule
+几何性能 & ATE / RPE / 深度误差 & 与强基线同量级，避免显著退化 \\
+语义稳定性 & 重访语义一致率、ID 保持率 & 相对单状态基线显著提升 \\
+效率与预算 & 运行时延、状态容量、峰值显存 & 在可部署预算内完成在线推理 \\
+可复现性 & 公开配置、脚本、消融矩阵 & 第三方可按文档复现实验 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{相关工作定位与创新边界}
+
+\subsection{三篇锚点工作的功能定位}
+\textbf{TTT3R} 提供了在线状态更新与重访更新机制，是本项目的主实现底座。\textbf{MERG3R} 展示了长时序状态分解、压缩与恢复的有效性，为本项目的事件触发压缩提供结构启发。\textbf{ZipMap} 强调线性状态读写思想与查询效率，为本项目的“线性可查询状态接口”提供方法学参照。
+
+\subsection{与传统语义 SLAM 的差异}
+传统语义 SLAM（如 SemanticFusion、DynaSLAM、DS-SLAM、PanopticFusion、Kimera）大多采用“几何前端 + 语义后端”的串行融合范式。本文工作不再将语义仅视为后处理标签，而是将语义状态纳入在线更新主回路，使其在状态空间中与几何状态并行演化，并通过门控机制抑制错误传播。
+
+\subsection{创新边界与可发表表述}
+本文不声称“首次引入测试时训练”或“首次进行语义 SLAM”，创新点集中在\textbf{统一机制设计}：
+\begin{itemize}
+  \item 双状态统一建模：将语义记忆显式参数化为可读写状态；
+  \item 门控更新策略：按观测置信与状态相似度自适应写回；
+  \item 事件触发压缩与重访恢复：在预算约束下保持长期可用性；
+  \item 长时序评估口径：强调重访一致性与预算效率的联合评价。
+\end{itemize}
+
+\section{方法：TTT3R+ 双状态线性 SLAM}
+
+\subsection{状态定义}
+设时刻 $t$ 的观测为 $o_t$。系统维护
+\begin{equation}
+\mathcal{S}_t = \{S_{geo}^t, S_{sem}^t\},
+\end{equation}
+其中 $S_{geo}^t$ 为几何状态，$S_{sem}^t$ 为语义状态。预测器输出几何估计 $\hat{g}_t$ 与语义估计 $\hat{y}_t$，并产生候选增量 $\Delta S_{geo}^t, \Delta S_{sem}^t$。
+
+\subsection{语义状态表示}
+语义状态由紧凑 token bank 构成：
+\begin{equation}
+S_{sem}^t = \{(k_i^t, v_i^t, c_i^t)\}_{i=1}^{N_t},
+\end{equation}
+其中 $k_i^t$ 为语义键，$v_i^t$ 为语义值，$c_i^t$ 为置信度或稳定度统计量。为避免状态无界增长，$N_t$ 受预算上界约束，超限时触发压缩模块。
+
+\subsection{线性读出（Read）}
+对查询 $q_t$，采用线性近似读出：
+\begin{equation}
+\tilde{y}_t = \sum_{i=1}^{N_t} \alpha_i(q_t, k_i^t)\, v_i^t,
+\end{equation}
+其中权重 $\alpha_i$ 由相似度与置信联合决定。该接口支持按区域、按类别、按重访目标的快速查询。
+
+\subsection{门控写回（Write）}
+对候选增量执行门控融合：
+\begin{equation}
+S_{sem}^{t+1} = (1-g_t)\odot S_{sem}^{t} + g_t\odot \Delta S_{sem}^{t}, \quad g_t\in[0,1].
+\end{equation}
+门控 $g_t$ 综合观测质量、几何一致性残差、历史稳定度等信号，核心目的在于\textbf{避免低质量观测对长期语义状态的破坏性覆盖}。
+
+\subsection{几何-语义一致性约束}
+引入联合一致性损失：
+\begin{equation}
+\mathcal{L}_{cons} = \lambda_1\mathcal{L}_{pose} + \lambda_2\mathcal{L}_{depth} + \lambda_3\mathcal{L}_{sem} + \lambda_4\mathcal{L}_{cross},
+\end{equation}
+其中 $\mathcal{L}_{cross}$ 约束语义边界与几何边界的对齐关系，抑制跨物体错误传播。
+
+\subsection{预算约束目标}
+在效率预算 $\mathcal{B}$ 下优化
+\begin{equation}
+\min\; \mathcal{L}_{task} + \beta\,\mathcal{C}(S_{geo}, S_{sem}) \quad \text{s.t.}\; \mathcal{C}(\cdot) \leq \mathcal{B},
+\end{equation}
+其中 $\mathcal{C}$ 表示状态容量、计算量与延迟的联合代价。
+
+\section{语义状态压缩与重访恢复（MERG3R-inspired）}
+
+\subsection{事件触发压缩}
+仅在事件触发时执行压缩（例如重访密度升高、状态冗余上升、预算逼近上限）：
+\begin{equation}
+\mathcal{T}_{compress}(t)=\mathbb{I}[r_t>\tau_r \;\lor\; u_t>\tau_u \;\lor\; b_t>\tau_b].
+\end{equation}
+触发后以聚类-蒸馏方式将局部语义块合并为紧凑原型，并保留必要索引供后续恢复。
+
+\subsection{重访恢复机制}
+当检测到回环或语义重访时，系统根据检索键恢复对应语义块并进行轻量校正，以提升跨时段一致性并降低重复学习成本。
+
+\subsection{复杂度直觉}
+若原始状态复杂度为 $O(N)$，压缩后有效复杂度趋近 $O(N')$（$N'\ll N$）。在长时序场景下，该机制主要改善的是状态读写开销与误差累积斜率，而非单帧预测上限。
+
+\section{工程改造落点（基于 TTT3R）}
+
+为保证方案可执行，本文将改造点限定在已确认代码入口，避免“概念创新与工程实现脱节”。
+
+\begin{table}[h]
+\centering
+\caption{核心工程改造锚点}
+\begin{tabular}{p{0.35\linewidth}p{0.58\linewidth}}
+\toprule
+文件/模块 & 改造要点 \\
+\midrule
+\code{TTT3R/src/dust3r/model.py} & 扩展双状态结构；在 \code{model_update_type} 分支中加入语义门控更新；在 \code{update_mask} 逻辑处引入语义置信调制；将语义状态纳入 recurrent rollout 与 reset 机制。 \\
+\code{TTT3R/src/dust3r/inference.py} & 对 \code{inference_step}、\code{inference_recurrent} 的状态传递接口进行双状态兼容改造，确保在线推理链路可携带语义状态。 \\
+\code{TTT3R/demo.py} & 暴露 \code{--model_update_type}、\code{update}、\code{reset_interval} 等开关，便于控制重访更新、冻结策略与长程评估脚本。 \\
+评估脚本层 & 在 relpose/depth 评估基础上新增重访一致性、语义保持率与预算效率统计，形成统一实验口径。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{ZipMap 未开源条件下的复现策略}
+
+\subsection{可复现声明}
+本项目不依赖 ZipMap 私有实现细节，采用“思想复现”策略：复现其线性状态读写与预算友好设计原则，而非声称对其源码的逐行重构。
+
+\subsection{公平比较原则}
+比较时遵循统一训练预算、统一评测协议与统一硬件约束，报告中明确区分“公开实现基线”与“思想复现模块”，避免不公平对比。
+
+\section{实验设计}
+
+\subsection{数据与任务}
+\begin{itemize}
+  \item 几何任务：相机轨迹估计与深度/点云重建；
+  \item 语义任务：跨时段语义保持与重访一致性；
+  \item 场景类型：室内外混合、动态与遮挡条件并存。
+\end{itemize}
+
+\subsection{指标体系}
+\begin{itemize}
+  \item 几何指标：ATE、RPE、深度误差；
+  \item 语义指标：mIoU、重访语义一致率、语义漂移率；
+  \item 系统指标：显存峰值、吞吐、平均时延、状态容量利用率。
+\end{itemize}
+
+\subsection{核心消融矩阵}
+\begin{table}[h]
+\centering
+\caption{建议消融矩阵}
+\begin{tabular}{p{0.36\linewidth}p{0.56\linewidth}}
+\toprule
+实验项 & 对比设置 \\
+\midrule
+状态结构消融 & 单状态 / 双状态（仅几何 / 几何+语义） \\
+更新策略消融 & 固定更新 / 门控更新 / 门控+置信调制 \\
+压缩策略消融 & 无压缩 / 周期压缩 / 事件触发压缩 \\
+重访恢复消融 & 无恢复 / 检索恢复 / 检索恢复+轻量校正 \\
+预算鲁棒性 & 不同状态上限与延迟预算下的性能-开销曲线 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{风险与应对}
+\begin{itemize}
+  \item \textbf{语义噪声累积风险}：通过门控阈值、置信退火与跨时序一致性正则降低误写回概率。
+  \item \textbf{几何与语义耦合冲突}：采用分阶段权重调度，先稳几何后强化语义。
+  \item \textbf{重访检测误触发}：结合几何回环候选与语义检索双重确认，降低误恢复。
+  \item \textbf{实验可复现风险}：提供固定随机种子、统一配置模板与完整消融脚本。
+\end{itemize}
+
+\section{里程碑（8--10 周）}
+\begin{itemize}
+  \item 第 1--2 周：完成双状态接口与基础门控更新，打通训练/推理链路。
+  \item 第 3--4 周：完成语义状态压缩与重访恢复原型，实现端到端运行。
+  \item 第 5--6 周：执行完整消融实验，收集性能-预算曲线。
+  \item 第 7--8 周：完成误差分析、可视化与报告主体撰写。
+  \item 第 9--10 周：补充对比实验、完善论文叙事与开源文档。
+\end{itemize}
+
+\section{结论}
+本文计划以 TTT3R 为工程主底座，构建语义-几何双状态线性 SLAM 框架。其核心价值不在于单一技巧堆叠，而在于将语义记忆、门控更新、压缩恢复与预算评估整合为统一系统机制。若实验验证成立，该方案有望在长期一致性与资源效率之间取得更优折中，并形成可发表、可复现的研究结果。
+
+\begin{thebibliography}{99}
+
+\bibitem{ttt3r2025}
+Y. Rao, et al.
+\newblock TTT3R: Test-Time Training for 3D Reconstruction.
+\newblock arXiv preprint, 2025.
+
+\bibitem{merg3r2026}
+M. Keetha, et al.
+\newblock MERG3R: Divide, Compress, and Recover for Long-Horizon 3D Reconstruction.
+\newblock arXiv preprint, 2026.
+
+\bibitem{zipmap2026}
+A. Eftekhar, et al.
+\newblock ZipMap: Revisiting Linearized State Space Models for Real-Time Dense Mapping.
+\newblock arXiv preprint, 2026.
+
+\bibitem{semanticfusion2017}
+J. McCormac, et al.
+\newblock SemanticFusion: Dense 3D Semantic Mapping with Convolutional Neural Networks.
+\newblock ICRA, 2017.
+
+\bibitem{dynaslam2018}
+B. Bescos, et al.
+\newblock DynaSLAM: Tracking, Mapping and Inpainting in Dynamic Scenes.
+\newblock RA-L/ICRA, 2018.
+
+\bibitem{dsslam2018}
+C. Yu, et al.
+\newblock DS-SLAM: A Semantic Visual SLAM towards Dynamic Environments.
+\newblock IROS, 2018.
+
+\bibitem{panopticfusion2019}
+T. M. Nguyen, et al.
+\newblock PanopticFusion: Online Volumetric Semantic Mapping at the Level of Stuff and Things.
+\newblock ICRA, 2019.
+
+\bibitem{kimera2020}
+A. Rosinol, et al.
+\newblock Kimera: an Open-Source Library for Real-Time Metric-Semantic Localization and Mapping.
+\newblock ICRA, 2020.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,195 @@
+================================================================================
+                    LoGoPlanner HPC 常用命令速查
+                    最后更新：2026-03-11
+================================================================================
+
+=== 1. SSH 登录 ===
+ssh login.torch.hpc.nyu.edu
+
+=== 2. 查看账号与分区 ===
+sacctmgr show assoc user=$USER format=Account,Partition,QOS -p
+sshare
+sinfo -o "%P %G %a"
+
+=== 3. 申请 GPU 节点（交互式） ===
+# H100 节点
+srun --account=torch_pr_769_tandon_advanced --partition=h100_tandon \
+  --gres=gpu:1 --mem=256G --time=1:00:00 --pty bash
+
+# H200 节点（略快 10-20%）
+srun --account=torch_pr_769_tandon_advanced --partition=h200_tandon \
+  --gres=gpu:1 --mem=256G --time=4:00:00 --pty bash
+
+=== 4. sbatch 批处理作业（推荐，长时间任务） ===
+# 提交作业
+cd ~/NavDP
+sbatch run_eval.sh
+# 输出：Submitted batch job 3748831
+
+# 查看作业状态
+squeue -u $USER
+
+# 查看实时输出（替换 job_id）
+tail -f eval_3748831.log
+
+# 查看作业历史
+sacct -j 3748831 --format=JobID,State,ExitCode,Elapsed,MaxRSS
+
+# 取消作业
+scancel 3748831
+
+# 切换到 H200 分区
+sed -i 's/h100_tandon/h200_tandon/' ~/NavDP/run_eval.sh
+
+=== 5. 激活 Conda 环境 ===
+# 推理环境（LoGoPlanner）
+conda activate /scratch/yz11502/conda_envs/navdp
+
+# 评估环境（Isaac Sim）
+conda activate /scratch/yz11502/conda_envs/isaaclab
+
+=== 6. 启动 LoGoPlanner 服务 ===
+cd ~/NavDP/baselines/logoplanner
+
+# 前台运行（调试用）
+python logoplanner_server.py --port 19999 \
+  --checkpoint $HOME/NavDP/baselines/logoplanner/logoplanner_policy.ckpt \
+  --host 0.0.0.0
+
+# 后台运行
+nohup python logoplanner_server.py --port 19999 \
+  --checkpoint $HOME/NavDP/baselines/logoplanner/logoplanner_policy.ckpt \
+  --host 0.0.0.0 > logoplanner.log 2>&1 &
+
+# 检查服务状态
+ps aux | grep logoplanner
+ss -tlnp | grep 19999
+tail -30 logoplanner.log
+
+# 停止服务
+pkill -f logoplanner_server
+
+=== 7. 运行评估 ===
+cd ~/NavDP
+python eval_startgoal_wheeled.py --port 19999 \
+  --scene_dir $HOME/NavDP/assets/scenes/cluttered_easy \
+  --scene_index 0 --scene_scale 1.0
+
+=== 8. 性能优化：安装 xFormers ===
+# 必须在 GPU 节点执行！
+conda activate /scratch/yz11502/conda_envs/navdp
+
+# 检查 PyTorch CUDA 版本
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, version: {torch.version.cuda}')"
+
+# 安装 xformers（CUDA 12.x 用 cu121）
+pip install xformers --index-url https://download.pytorch.org/whl/cu121
+
+# 验证安装
+python -c "import xformers; print('xformers version:', xformers.__version__)"
+python -c "from xformers.ops import memory_efficient_attention; print('xformers CUDA ops OK')"
+
+=== 9. SSH 端口转发（本地访问 HPC 服务） ===
+# 替换 gh123 为实际计算节点 hostname
+ssh -L 19999:gh123:19999 yz11502@login.torch.hpc.nyu.edu
+
+# 验证
+curl http://localhost:19999/
+
+=== 10. 本地同步文件到 HPC（PowerShell） ===
+cd c:\Users\zhuya\Desktop\navigation\NavDP
+
+scp baselines/logoplanner/logoplanner_server.py yz11502@login.torch.hpc.nyu.edu:~/NavDP/baselines/logoplanner/
+scp utils_tasks/client_utils.py yz11502@login.torch.hpc.nyu.edu:~/NavDP/utils_tasks/
+scp eval_startgoal_wheeled.py eval_imagegoal_wheeled.py eval_pointgoal_wheeled.py yz11502@login.torch.hpc.nyu.edu:~/NavDP/
+scp run_eval.sh yz11502@login.torch.hpc.nyu.edu:~/NavDP/
+
+================================================================================
+                    当前状态（2026-03-11 探查完成）
+================================================================================
+- xFormers: ✅ 已安装 0.0.29.post1
+- RoPE2D CUDA: ⚠️ 不可用（Pi3 上游未提供）
+- 每步推理耗时: ~5-7 秒（RoPE2D 瓶颈）
+- 推荐运行方式: sbatch 批处理（12+ 小时）
+
+=== cluttered_easy 评估结果（20 episodes） ===
+- 总体 SR: 50%
+- 10-15m: SR=86%, 15-20m: SR=60%, 20-30m: SR=12.5%
+- 结论: Horizon Scaling 假设已验证！
+
+=== 场景距离分布 ✅ 全部确认 ===
+| 场景集                  | 距离范围    | 平均距离 | 子场景数      |
+|-------------------------|-------------|----------|---------------|
+| internscenes_home       | 4.0-13.6m   | ~6m      | 多个          |
+| internscenes_commercial | 4.0-14.2m   | ~6m      | 10+           |
+| cluttered_easy          | 10.1-29.8m  | ~18m     | easy_0~9      |
+| cluttered_hard          | 10.0-30.0m  | ~19m     | hard_0~9      |
+
+⚠️ 超长距离场景 (40m+) 不存在，需自行生成
+✅ cluttered_hard 与 easy 距离相同但障碍更复杂 → 适合 Hidden Detour 测试
+================================================================================
+
+=== 11. Long-horizon Benchmark 命令 ===
+
+# ===== P0: 短距离基准评估 =====
+sbatch ~/NavDP/run_eval_internscenes.sh
+
+# ===== P0: Hidden Detour 实验 (cluttered_hard vs easy) =====
+sbatch ~/NavDP/run_eval_cluttered_hard.sh
+
+# ===== 创建 sbatch 脚本（如果不存在） =====
+
+# internscenes_home 评估脚本
+cat > ~/NavDP/run_eval_internscenes.sh << 'EOF'
+#!/bin/bash
+#SBATCH --job-name=eval_internscenes
+#SBATCH --account=torch_pr_769_tandon_advanced
+#SBATCH --partition=h100_tandon
+#SBATCH --gres=gpu:1
+#SBATCH --mem=256G
+#SBATCH --time=8:00:00
+#SBATCH --output=eval_internscenes_%j.log
+
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate /scratch/yz11502/conda_envs/navdp
+cd ~/NavDP/baselines/logoplanner
+python logoplanner_server.py --port 19999 \
+  --checkpoint $HOME/NavDP/baselines/logoplanner/logoplanner_policy.ckpt \
+  --host 0.0.0.0 &
+sleep 90
+conda activate /scratch/yz11502/conda_envs/isaaclab
+cd ~/NavDP
+python eval_startgoal_wheeled.py --port 19999 \
+  --scene_dir $HOME/NavDP/assets/scenes/internscenes_home \
+  --scene_index 0 --scene_scale 1.0 --num_episodes 30
+pkill -f logoplanner_server
+EOF
+chmod +x ~/NavDP/run_eval_internscenes.sh
+
+# cluttered_hard 评估脚本
+cat > ~/NavDP/run_eval_cluttered_hard.sh << 'EOF'
+#!/bin/bash
+#SBATCH --job-name=eval_cluttered_hard
+#SBATCH --account=torch_pr_769_tandon_advanced
+#SBATCH --partition=h100_tandon
+#SBATCH --gres=gpu:1
+#SBATCH --mem=256G
+#SBATCH --time=12:00:00
+#SBATCH --output=eval_cluttered_hard_%j.log
+
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate /scratch/yz11502/conda_envs/navdp
+cd ~/NavDP/baselines/logoplanner
+python logoplanner_server.py --port 19999 \
+  --checkpoint $HOME/NavDP/baselines/logoplanner/logoplanner_policy.ckpt \
+  --host 0.0.0.0 &
+sleep 90
+conda activate /scratch/yz11502/conda_envs/isaaclab
+cd ~/NavDP
+python eval_startgoal_wheeled.py --port 19999 \
+  --scene_dir $HOME/NavDP/assets/scenes/cluttered_hard \
+  --scene_index 0 --scene_scale 1.0 --num_episodes 20
+pkill -f logoplanner_server
+EOF
+chmod +x ~/NavDP/run_eval_cluttered_hard.sh
+================================================================================
