@@ -1,0 +1,8 @@
+latex/*.aux
+latex/*.log
+latex/*.out
+latex/*.toc
+latex/*.fdb_latexmk
+latex/*.fls
+latex/*.synctex.gz
+TTT3R/demo_tmp/

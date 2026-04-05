@@ -1,0 +1,82 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue
+}
+\setlist[itemize]{leftmargin=1.4em,topsep=2pt,itemsep=1pt,parsep=0pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.35em}
+\titlespacing*{\section}{0pt}{0.6em}{0.25em}
+
+\title{Final Project Proposal:\\Hierarchical Memory for Continual Visual Persistence and Retrieval in Streaming 3D Reconstruction}
+\author{\large Yanheng Zhu \quad Yongzhe Zhao \quad Peng Yue\\[0.35em]\normalsize Computer Vision}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.3em}
+
+\section*{Problem}
+Online 3D reconstruction aims to recover scene geometry from a video stream while processing frames sequentially. This problem is important in robotics, embodied AI, and AR/VR because a useful system must do more than predict depth frame by frame; it must also maintain a coherent geometric map over time. In practice, many current online reconstruction models perform well on short sequences but degrade noticeably on long ones. At the short range, they may lose local detail under viewpoint change, occlusion, or ambiguous texture. At the long range, they may forget early observations, confuse repeated structures such as similar corridors or doors, and fail to recover useful geometry when the camera revisits a previously seen region.
+
+In this project, we propose to study \textbf{bounded-memory online 3D reconstruction that improves both short-term local quality and long-term global consistency}. Our goal is not to build a full SLAM or navigation system, but to design a stronger streaming reconstruction pipeline that preserves local detail, stores important historical information, compresses outdated regions when needed, and restores geometry during revisits.
+
+\section*{ML Solution}
+Our central hypothesis is that the main bottleneck is not only the reconstruction backbone itself, but also \textbf{how learned geometric representations are stored, updated, and reused over time}. We plan to start from TTT3R, a neural online reconstruction model that already improves long-sequence behavior through test-time state updates, and extend it with a hierarchical memory mechanism.
+
+The proposed system will use three levels of memory. A \textbf{short-term memory} will keep recent frames and local geometric tokens to preserve local detail and stabilize local geometry. An \textbf{active long-term memory} will maintain a persistent online state for the current region, updated using confidence-aware rules inspired by TTT3R. An \textbf{archived submap memory} will store compact summaries of regions that are no longer active, so that the system can retrieve them later during revisits.
+
+This remains an ML project because the core reconstruction engine is a learned neural model, and the proposed contribution focuses on improving how learned internal representations are managed over long time horizons. Rather than training a new backbone from scratch, we will adapt a strong pretrained model and test whether a better memory design improves reconstruction quality and length generalization.
+
+\section*{Dataset}
+We will primarily use public datasets that are standard in neural 3D reconstruction research and are easy to access:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{ScanNet}: indoor RGB-D video sequences with camera poses and depth, useful for long-horizon pose and reconstruction evaluation.
+  \item \textbf{7-Scenes}: compact indoor scenes with revisits and repeated views, useful for reconstruction and loop/revisit behavior.
+  \item \textbf{TUM RGB-D / TUM-dynamics}: useful for testing trajectory quality, dynamic content, and robustness to sequence changes.
+\end{itemize}
+
+In addition, we may use the \textbf{UniFoLM-WBT Dataset} collection released by Unitree Robotics on Hugging Face (\url{https://huggingface.co/collections/unitreerobotics/unifolm-wbt-dataset}) as a supplementary robotics-domain dataset. According to the collection page, it contains real whole-body task data such as collecting clothes, picking up pillows, and placing objects with main-camera recordings. Because this collection is accessible online and contains long task sequences, it is useful for qualitative tests or domain-specific experiments in embodied robotics. Our main quantitative benchmarks, however, will still rely on datasets with clearer geometry or trajectory supervision.
+
+\section*{Method}
+The planned method combines ideas from several recent papers, but the system will be centered on one practical design: \textbf{hierarchical memory for streaming 3D reconstruction}. The base model will be TTT3R, which already improves long-sequence behavior by changing how the online state is updated at test time. On top of this backbone, we plan to add:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Short-term working memory}: a small buffer of recent frames or tokens that preserves local detail and supports accurate local geometry.
+  \item \textbf{Importance-based memory maintenance}: inspired by recent constant-cost streaming geometry models, important tokens will be retained while less useful ones will be pruned, and a small set of anchor tokens will be protected from deletion.
+  \item \textbf{Submap archive and retrieval}: when the system leaves an area, its active memory will be compressed into a compact submap summary. During revisits, the system will retrieve matching submaps and use them as priors.
+  \item \textbf{Query-based summary tokens}: instead of averaging all historical features, the model will use learned query readouts to produce compact pose, geometry, and retrieval summaries.
+\end{itemize}
+
+In other words, the method is designed to solve two connected problems at once: \textbf{short-range local reconstruction quality} and \textbf{long-range memory consistency}. If implementation time allows, we may also add a stronger local refinement module for short windows, inspired by recent visual geometry transformers. However, the main contribution of the project will be the memory design rather than a completely new backbone.
+
+\section*{Evaluation Plan}
+We will evaluate the method by comparing three systems: (1) the original CUT3R-style baseline, (2) TTT3R, and (3) our hierarchical-memory version. The evaluation will include both standard reconstruction metrics and long-horizon stress tests.
+
+For standard evaluation, we will report:
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Pose metrics}: Absolute Trajectory Error (ATE) and Relative Pose Error (RPE).
+  \item \textbf{Depth metrics}: Abs Rel, RMSE, and related depth accuracy scores.
+  \item \textbf{3D reconstruction metrics}: point cloud accuracy, completion, and normal consistency.
+\end{itemize}
+
+To measure whether the proposed design actually solves the intended problem, we will also evaluate:
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Short-range quality}: whether local geometry remains stable under fast viewpoint changes or ambiguous local observations.
+  \item \textbf{Horizon scaling}: how performance degrades as sequence length increases.
+  \item \textbf{Branch disambiguation}: whether the model confuses visually similar but globally different regions.
+  \item \textbf{Revisit recovery}: whether archived memory helps when the camera returns to a previously seen area.
+  \item \textbf{Efficiency}: GPU memory, number of active tokens, and runtime.
+\end{itemize}
+
+The project will be successful if the proposed method shows slower performance degradation on long sequences, fewer confusions in repeated environments, and better recovery during revisits while keeping memory growth under control. More broadly, we hope to show that long-horizon reconstruction is not only a modeling problem, but also a memory-management problem.
+
+\end{document}

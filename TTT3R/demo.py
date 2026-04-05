@@ -113,6 +113,17 @@ def parse_args():
         default=1,
         help="Downsample factor for the point cloud viewer",
     )
+    parser.add_argument(
+        "--no_viewer",
+        action="store_true",
+        help="Run inference and save outputs without launching the interactive viewer.",
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=0,
+        help="Optional cap on the number of frames to process after sampling; 0 means no cap.",
+    )
     return parser.parse_args()
 
 
@@ -366,7 +377,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     # # convert_scene_output_to_glb(outdir, (colors_tosave * 255).to(torch.uint8), pts3ds_other_tosave, conf_other_tosave > 1, focal, cam2world_tosave, as_pointcloud=True)
     return pts3ds_other, colors, conf_other, cam_dict
 
-def parse_seq_path(p, frame_interval=1):
+def parse_seq_path(p, frame_interval=1, max_frames=0):
     global framerate
     
     if os.path.isdir(p):
@@ -382,6 +393,10 @@ def parse_seq_path(p, frame_interval=1):
             img_paths = img_paths[::frame_interval]
             print(f" - Image sequence: Total images: {len(all_img_paths)}, "
                   f"Frame interval: {frame_interval}, Images to process: {len(img_paths)}")
+
+        if max_frames > 0:
+            img_paths = img_paths[:max_frames]
+            print(f" - Max frames cap applied: processing {len(img_paths)} images")
         
         framerate = 30.0 / frame_interval
         
@@ -399,6 +414,8 @@ def parse_seq_path(p, frame_interval=1):
         framerate = video_fps / frame_interval
         
         frame_indices = list(range(0, total_frames, frame_interval))
+        if max_frames > 0:
+            frame_indices = frame_indices[:max_frames]
         print(
             f" - Video FPS: {video_fps}, Frame Interval: {frame_interval}, Total Frames to Read: {len(frame_indices)}, Processed Framerate: {framerate}"
         )
@@ -438,7 +455,7 @@ def run_inference(args):
     from viser_utils import PointCloudViewer
 
     # Prepare image file paths.
-    img_paths, tmpdirname = parse_seq_path(args.seq_path, args.frame_interval)
+    img_paths, tmpdirname = parse_seq_path(args.seq_path, args.frame_interval, args.max_frames)
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return
@@ -490,6 +507,10 @@ def run_inference(args):
     edge_colors = [None] * len(pts3ds_to_vis)
 
     # Create and run the point cloud viewer.
+    if args.no_viewer:
+        print(f"Saved outputs to {args.output_dir} without launching the viewer.")
+        return
+
     print("Launching point cloud viewer...")
     viewer = PointCloudViewer(
         model,

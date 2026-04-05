@@ -1,300 +1,804 @@
 \documentclass[12pt]{article}
 \usepackage[UTF8]{ctex}
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath,amssymb,mathtools}
 \usepackage{graphicx}
 \usepackage{geometry}
 \usepackage{hyperref}
 \usepackage{booktabs}
-\usepackage{xcolor}
 \usepackage{array}
-\geometry{a4paper,margin=1in}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{xcolor}
 
+\geometry{a4paper,margin=1in}
 \hypersetup{
   colorlinks=true,
   linkcolor=blue,
   citecolor=blue,
   urlcolor=blue
 }
+\setlist[itemize]{leftmargin=1.8em}
+\setlist[enumerate]{leftmargin=2.0em}
 
 \newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\method}{\textbf{HMR3D}}
+\newcommand{\argmax}{\mathop{\mathrm{argmax}}}
 
-\title{基于 TTT3R+ 的语义-几何双状态线性 SLAM 研究计划}
+\title{
+面向长时程在线三维重建的分层记忆系统研究计划\\
+\large 基于 TTT3R、VGGT、OVGGT、MERG3R 与 LoGoPlanner 思想的统一方案
+}
 \author{CVPR Final Project Proposal}
-\date{\today}
+\date{2026-04-05}
 
 \begin{document}
 \maketitle
+
+\begin{abstract}
+本项目聚焦于\textbf{长时程在线三维重建}，目标是在固定显存与计算预算下，使系统在长序列、重复结构和重访场景中保持更稳定的几何一致性，而不是将项目包装成完整的端到端 SLAM 或导航系统。我们将当前仓库中的 TTT3R 视为在线重建主干，其优势在于通过测试时更新规则改善长序列长度泛化；在此基础上，本文提出一个新的分层记忆方案 \method{}：使用 TTT3R 风格的在线 active-state 作为实时主路径，使用 VGGT 风格的局部高质量几何求解器提升短程精度，使用 OVGGT 风格的重要性缓存与 anchor 保护控制预算，使用 MERG3R 风格的子图归档与恢复机制建立可重访的长期记忆，并将 LoGoPlanner 的 query-based geometry readout 思想用于 token 汇总、描述子构造和子图摘要生成。
+
+本文首先明确在线三维重建与 SLAM 的边界：我们不以全局导航和闭环控制为目标，而是以\textbf{持续建图、重访恢复、全局消歧和预算受限条件下的长程稳定性}为核心问题。随后，本文给出完整的方法定义，包括状态表示、token 类型、短程层、长程活动层、归档层、路由器机制、事件触发策略、最小可行实现路径和扩展版本；同时提出一套完整的评测协议，既保留 TTT3R 官方的 pose、depth 和 reconstruction 基线评测，也引入 Horizon Scaling、Branch Disambiguation、Forced Backtracking 与 Revisit/Loop-closure 等针对长期记忆能力的 stress tests。
+
+我们预计该方案的主要贡献在于：将在线重建从单一 recurrent state 扩展为可写入、可保留、可归档、可恢复的分层记忆系统；建立适合在线重建而非纯导航的长程评测协议；并给出一条能够在当前 TTT3R 代码库中逐步落地、风险可控、可做消融验证的实现路线。
+\end{abstract}
+
 \tableofcontents
 \newpage
 
-\section{研究目标、创新点与执行计划（摘要）}
+\section{项目定位与问题定义}
 
-\subsection{总体目标}
-本项目的核心目标是在 TTT3R 工程底座上实现一个\textbf{语义-几何双状态线性 SLAM} 系统，在固定预算下同时优化三类能力：
-\begin{itemize}
-  \item 长时几何一致性（轨迹与结构稳定）；
-  \item 长时语义一致性（重访语义不漂移）；
-  \item 资源效率（时延、显存、状态容量可控）。
-\end{itemize}
+\subsection{项目边界：在线三维重建不是完整 SLAM}
 
-\subsection{主要创新点（对外可陈述）}
-本文创新不在“首次使用 TTT”，而在\textbf{在线状态机制设计}：
-\begin{enumerate}
-  \item \textbf{语义-几何双状态联合建模}：语义不再是后处理标签，而是与几何并行演化的可读写状态；
-  \item \textbf{不确定性门控写回}：由观测质量、几何残差与历史稳定度共同决定是否写回，抑制错误累积；
-  \item \textbf{事件触发压缩与重访恢复}：在预算约束下保持长期可用状态，平衡性能与开销；
-  \item \textbf{长时序联合评测口径}：同时报告几何、语义与系统预算指标，形成完整证据链。
-\end{enumerate}
+本项目的核心任务是\textbf{在线三维重建 / 在线建图}，而不是完整的 SLAM 系统。为了避免概念混淆，表~\ref{tab:recon-vs-slam} 对两者的目标与评测重点进行区分。
 
-\subsection{现有方向与本项目定位}
-现有相关方向可分为三类：
-\begin{itemize}
-  \item \textbf{在线几何更新方向}（以 TTT3R/CUT3R 为代表）：擅长在线几何优化，但语义通常未进入状态主回路；
-  \item \textbf{长时压缩恢复方向}（以 MERG3R 思路为代表）：擅长长期状态管理，但未显式构建语义-几何联合门控；
-  \item \textbf{语义 SLAM 方向}（SemanticFusion/DynaSLAM 等）：强调语义与几何融合，但多数不以预算约束下的在线状态写回机制为核心。
-\end{itemize}
-本项目定位为三者的统一机制化扩展：在 TTT3R 可执行链路中落地双状态、门控和压缩恢复，而不是简单模块叠加。
-
-\subsection{执行计划与阶段交付}
-\begin{itemize}
-  \item \textbf{阶段 A（接口打通）}：完成双状态数据结构与推理链路改造，交付可运行原型；
-  \item \textbf{阶段 B（机制落地）}：实现门控写回、事件触发压缩与重访恢复，交付消融开关；
-  \item \textbf{阶段 C（系统评测）}：构建统一指标与预算曲线，交付完整实验表；
-  \item \textbf{阶段 D（论文化收敛）}：完成误差分析、可视化与可复现文档，交付投稿版本报告。
-\end{itemize}
-
-\section{项目目标与问题定义}
-
-\subsection{研究问题}
-本项目关注开放场景中的在线三维重建与定位问题：系统在连续观测流下，需要同时维持几何一致性与语义稳定性，并在重访场景时保持可恢复、可查询、可扩展的状态表示。我们将该问题表述为\textbf{语义-几何双状态线性 SLAM}：
-\begin{itemize}
-  \item 几何状态 $S_{geo}$ 负责位姿与结构的一致估计；
-  \item 语义状态 $S_{sem}$ 负责跨时刻语义记忆与重访保持；
-  \item 两类状态以统一门控策略执行增量写回，以避免错误语义长期污染全局状态。
-\end{itemize}
-
-\subsection{最终目标}
-我们期望在 TTT3R/CUT3R 可执行框架上，构建一个可复现、可消融、可度量的双状态原型系统，并回答以下研究问题：
-\begin{enumerate}
-  \item 语义状态是否能在几何精度基本不退化的前提下提升重访一致性？
-  \item 门控更新与事件触发压缩是否能提升长期稳定性与状态利用效率？
-  \item 双状态机制在预算受限条件下是否优于单状态基线？
-\end{enumerate}
-
-\subsection{验收标准}
-\begin{table}[h]
+\begin{table}[H]
 \centering
-\caption{项目验收标准}
-\begin{tabular}{p{0.23\linewidth}p{0.30\linewidth}p{0.35\linewidth}}
+\caption{在线三维重建与 SLAM 的区别}
+\label{tab:recon-vs-slam}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.18\linewidth}XX}
 \toprule
-维度 & 指标 & 目标 \\
+维度 & 在线三维重建 & SLAM \\
 \midrule
-几何性能 & ATE / RPE / 深度误差 & 与强基线同量级，避免显著退化 \\
-语义稳定性 & 重访语义一致率、ID 保持率 & 相对单状态基线显著提升 \\
-效率与预算 & 运行时延、状态容量、峰值显存 & 在可部署预算内完成在线推理 \\
-可复现性 & 公开配置、脚本、消融矩阵 & 第三方可按文档复现实验 \\
+核心目标 & 持续恢复场景几何、深度、点云或稠密结构 & 同时估计位姿并维护可用于定位的地图 \\
+输出重点 & depth、point map、point cloud、submap、dense latent map & trajectory、relocalization、loop closure、global map \\
+主要约束 & 长序列下的几何一致性、预算受限的持续推理 & 实时定位稳定性、重定位、回环、闭环控制接口 \\
+常见失败模式 & 长序列漂移、历史信息遗忘、重复结构混淆、局部几何退化 & 丢跟踪、重定位失败、回环错误、拓扑错乱 \\
+典型指标 & 深度误差、点云精度、完整度、法向一致性、长程漂移曲线 & ATE、RPE、追踪成功率、回环收益、重定位成功率 \\
+本项目定位 & 主轴在在线重建，借鉴 SLAM 中子图、重访、长期记忆思想 & 不是完整目标，只借鉴其长期地图组织机制 \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{table}
 
-\section{相关工作定位与创新边界}
+因此，最准确的项目表述不是“我们做了一个新 SLAM”，而是：
+\begin{quote}
+我们研究的是\textbf{SLAM 启发的长时程在线三维重建}，目标是在固定预算下提升长期几何一致性、全局消歧能力和重访恢复能力。
+\end{quote}
 
-\subsection{三篇锚点工作的功能定位}
-\textbf{TTT3R} 提供了在线状态更新与重访更新机制，是本项目的主实现底座。\textbf{MERG3R} 展示了长时序状态分解、压缩与恢复的有效性，为本项目的事件触发压缩提供结构启发。\textbf{ZipMap} 强调线性状态读写思想与查询效率，为本项目的“线性可查询状态接口”提供方法学参照。
+\subsection{项目目标}
 
-\subsection{与传统语义 SLAM 的差异}
-传统语义 SLAM（如 SemanticFusion、DynaSLAM、DS-SLAM、PanopticFusion、Kimera）大多采用“几何前端 + 语义后端”的串行融合范式。本文工作不再将语义仅视为后处理标签，而是将语义状态纳入在线更新主回路，使其在状态空间中与几何状态并行演化，并通过门控机制抑制错误传播。
+本项目的最终成果不应定义为“接入了更多模块”或“切换了某种地图表示”，而应定义为系统层面的可验证能力提升：
+\begin{enumerate}
+  \item 在\textbf{固定显存与计算预算}下，随着 horizon 增长，性能退化速度更慢。
+  \item 在\textbf{重复走廊、相似门口、对称分叉}等局部高相似场景中，更不容易发生全局混淆。
+  \item 在\textbf{重访与回到旧区域}时，能够通过历史子图检索与恢复降低累计漂移。
+  \item 在\textbf{在线流式模式}下工作，而不是依赖离线全局批处理。
+\end{enumerate}
 
-\subsection{创新边界与可发表表述}
-本文不声称“首次引入测试时训练”或“首次进行语义 SLAM”，创新点集中在\textbf{统一机制设计}：
+\subsection{为什么当前单一在线状态仍然不够}
+
+TTT3R 已经表明，仅通过修改测试时状态更新规则，就能显著提升 CUT3R 这类 recurrent 3D reconstruction foundation model 的长度泛化能力。然而，这类方法仍然主要依赖\textbf{单一活动状态}来同时承担以下任务：
 \begin{itemize}
-  \item 双状态统一建模：将语义记忆显式参数化为可读写状态；
-  \item 门控更新策略：按观测置信与状态相似度自适应写回；
-  \item 事件触发压缩与重访恢复：在预算约束下保持长期可用性；
-  \item 长时序评估口径：强调重访一致性与预算效率的联合评价。
+  \item 表示最近观测的局部细节；
+  \item 保留长期历史信息；
+  \item 在预算受限时进行压缩；
+  \item 在重访时恢复历史结构。
 \end{itemize}
 
-\section{方法：TTT3R+ 双状态线性 SLAM}
+这四类职责具有内在冲突。局部细节要求状态保持高分辨率；长期记忆要求状态具有稳定性；预算控制要求状态被压缩；重访恢复又要求历史信息可检索且可注入。把所有职责压缩进同一个 recurrent state，通常会带来三类问题：
+\begin{enumerate}
+  \item \textbf{长期信息覆盖}：新的观测不断写入时，早期区分性线索会被覆盖。
+  \item \textbf{局部相似导致的全局混淆}：若缺乏 persistent global memory，重复结构下容易误把新区域当旧区域，或把旧区域当新区域。
+  \item \textbf{预算受限时没有明确的保留原则}：若不显式区分 anchor、context 与 archived submap，就很难回答“哪些必须保留，哪些可以删除，哪些应该归档”。
+\end{enumerate}
+
+因此，本项目的核心假设是：
+\begin{quote}
+在线三维重建的长程问题，本质上不是只靠“更强 backbone”解决，而是要把单一在线状态升级为\textbf{分层记忆系统}。
+\end{quote}
+
+\section{相关工作与设计原则}
+
+\subsection{截至 2026-04-05 的关键相关工作}
+
+表~\ref{tab:related-work} 总结了当前最相关的几条技术路线，以及本项目将从中具体借用什么。
+
+\begin{table}[H]
+\centering
+\caption{关键相关工作与本项目的借鉴方式}
+\label{tab:related-work}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.18\linewidth} >{\raggedright\arraybackslash}p{0.14\linewidth} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X}
+\toprule
+工作 & 已核对时间 & 论文核心点 & 本项目借鉴方式 \\
+\midrule
+TTT3R & 2025-09-30 提交，2026-03-03 修订 & 将在线重建视为测试时在线学习问题，基于 alignment confidence 给出 closed-form update rate & 作为实时主干的 active-state 写入规则 \\
+VGGT & 2025-03-14 提交 & 用 feed-forward 模型直接输出相机、point map、depth 和 point track & 作为短程高质量局部重建器或其设计原型 \\
+Streaming 4D VGGT & 2025-07-15 提交，2026-03-31 修订 & 因果 transformer + historical KV cache 的流式重建 & 说明局部流式高质量模块是可行的，但 cache 仍需受控 \\
+OVGGT & 2026-03-06 提交，2026-03-09 修订 & Self-Selective Caching + Dynamic Anchor Protection，实现常数级成本流式几何推理 & 提供训练无关的 keep/evict 与 anchor 保护原则 \\
+MERG3R & 2026-03-02 提交 & reorder、partition、overlap、global alignment 与 confidence-weighted BA 的 divide-and-conquer 框架 & 作为归档子图的 merge/recovery 机制 \\
+LoGoPlanner & 2025-12-22 提交，2025-12-23 修订 & metric-aware geometry memory + query-based readout，用隐式几何记忆服务规划 & 不借其 planner head，只借其 query-based token aggregation 与 geometry readout \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{五条设计原则}
+
+综合上述工作，本项目采用以下设计原则：
+\begin{enumerate}
+  \item \textbf{在线主路径必须简单稳定。} 实时主干不应依赖复杂的全局批处理，因此保留 TTT3R/CUT3R 风格的递归更新主路径。
+  \item \textbf{短程高精度与长程可持续应分开处理。} 短程问题适合 VGGT 类强局部几何推理，长程问题适合 persistent state 和 archive/retrieve 机制。
+  \item \textbf{预算控制优先使用训练无关的显式规则。} 在项目早期，不引入黑盒 learned router，而是优先采用 OVGGT 风格的重要性剪枝和 anchor 保护。
+  \item \textbf{长期记忆应以子图而非单一 latent 组织。} 归档层采用 MERG3R 风格的 submap 思想，避免把所有历史信息压成不可恢复的单状态。
+  \item \textbf{LoGoPlanner 只用于“如何读和汇总几何记忆”。} 不使用其导航头，不把其 latent policy 作为本项目主目标。
+\end{enumerate}
+
+\section{整体方案：\method{}}
+
+\subsection{方法概述}
+
+我们将提出一个新的分层记忆系统 \method{}（Hierarchical Memory Reconstruction for 3D）。系统的主流程如下：
+\begin{enumerate}
+  \item 输入当前帧 $x_t$ 及其基础几何先验，编码为 observation tokens。
+  \item 进入\textbf{短程层}，结合最近窗口与局部 anchors，得到局部几何摘要、位姿摘要和重访描述子。
+  \item 由\textbf{路由器}判断当前信息应如何处理：写入活动状态、晋升为 anchor、归档为子图，或直接丢弃。
+  \item \textbf{活动层}在 TTT3R 风格写入规则下持续更新，同时使用 OVGGT 风格的重要性评分和 anchor 保护控制预算。
+  \item 当出现场景切换、预算压力或重访触发时，\textbf{归档层}把活动子图压缩为可检索子图，并在需要时按 MERG3R 风格进行对齐、合并和恢复。
+  \item \textbf{LoGoPlanner 风格 query tokens}贯穿于短程读出、子图摘要与重访检索三个阶段，用于把几何记忆转化为可用的摘要，而不是原样传递所有 token。
+\end{enumerate}
 
 \subsection{状态定义}
-设时刻 $t$ 的观测为 $o_t$。系统维护
+
+在时间步 $t$，系统状态定义为
 \begin{equation}
-\mathcal{S}_t = \{S_{geo}^t, S_{sem}^t\},
+\mathcal{S}_t = \{M_{\text{short}}^t,\; M_{\text{active}}^t,\; B_{\text{bank}}^t\},
 \end{equation}
-其中 $S_{geo}^t$ 为几何状态，$S_{sem}^t$ 为语义状态。预测器输出几何估计 $\hat{g}_t$ 与语义估计 $\hat{y}_t$，并产生候选增量 $\Delta S_{geo}^t, \Delta S_{sem}^t$。
+其中：
+\begin{itemize}
+  \item $M_{\text{short}}^t$ 为短程局部工作区，负责最近观测的高保真建模；
+  \item $M_{\text{active}}^t$ 为当前活动区域的 persistent online state；
+  \item $B_{\text{bank}}^t$ 为已归档的历史子图库，可检索、可恢复。
+\end{itemize}
 
-\subsection{语义状态表示}
-语义状态由紧凑 token bank 构成：
+给定当前观测 $x_t$，系统还将计算若干中间量：
 \begin{equation}
-S_{sem}^t = \{(k_i^t, v_i^t, c_i^t)\}_{i=1}^{N_t},
+\Delta_t,\; c_{\text{align}}^t,\; s_{\text{import}}^t,\; d_t,\; u_t,\; q_{\text{pose}}^t,\; q_{\text{geo}}^t,\; q_{\text{desc}}^t,\; q_{\text{sum}}^t,
 \end{equation}
-其中 $k_i^t$ 为语义键，$v_i^t$ 为语义值，$c_i^t$ 为置信度或稳定度统计量。为避免状态无界增长，$N_t$ 受预算上界约束，超限时触发压缩模块。
+其中：
+\begin{itemize}
+  \item $\Delta_t$ 表示候选状态增量；
+  \item $c_{\text{align}}^t$ 表示新观测与当前记忆的一致性；
+  \item $s_{\text{import}}^t$ 表示 token 重要性；
+  \item $d_t$ 表示当前窗口的重访检索描述子；
+  \item $u_t$ 表示当前局部的歧义/不确定性强度；
+  \item 四类 query token 分别用于位姿读出、几何读出、检索读出与摘要读出。
+\end{itemize}
 
-\subsection{线性读出（Read）}
-对查询 $q_t$，采用线性近似读出：
-\begin{equation}
-\tilde{y}_t = \sum_{i=1}^{N_t} \alpha_i(q_t, k_i^t)\, v_i^t,
-\end{equation}
-其中权重 $\alpha_i$ 由相似度与置信联合决定。该接口支持按区域、按类别、按重访目标的快速查询。
+\subsection{token 类型设计}
 
-\subsection{门控写回（Write）}
-对候选增量执行门控融合：
-\begin{equation}
-S_{sem}^{t+1} = (1-g_t)\odot S_{sem}^{t} + g_t\odot \Delta S_{sem}^{t}, \quad g_t\in[0,1].
-\end{equation}
-门控 $g_t$ 综合观测质量、几何一致性残差、历史稳定度等信号，核心目的在于\textbf{避免低质量观测对长期语义状态的破坏性覆盖}。
+本项目不再把所有信息都视为“同一种 token”，而是明确区分五类 token，如表~\ref{tab:token-types} 所示。
 
-\subsection{几何-语义一致性约束}
-引入联合一致性损失：
-\begin{equation}
-\mathcal{L}_{cons} = \lambda_1\mathcal{L}_{pose} + \lambda_2\mathcal{L}_{depth} + \lambda_3\mathcal{L}_{sem} + \lambda_4\mathcal{L}_{cross},
-\end{equation}
-其中 $\mathcal{L}_{cross}$ 约束语义边界与几何边界的对齐关系，抑制跨物体错误传播。
-
-\subsection{预算约束目标}
-在效率预算 $\mathcal{B}$ 下优化
-\begin{equation}
-\min\; \mathcal{L}_{task} + \beta\,\mathcal{C}(S_{geo}, S_{sem}) \quad \text{s.t.}\; \mathcal{C}(\cdot) \leq \mathcal{B},
-\end{equation}
-其中 $\mathcal{C}$ 表示状态容量、计算量与延迟的联合代价。
-
-\section{语义状态压缩与重访恢复（MERG3R-inspired）}
-
-\subsection{事件触发压缩}
-仅在事件触发时执行压缩（例如重访密度升高、状态冗余上升、预算逼近上限）：
-\begin{equation}
-\mathcal{T}_{compress}(t)=\mathbb{I}[r_t>\tau_r \;\lor\; u_t>\tau_u \;\lor\; b_t>\tau_b].
-\end{equation}
-触发后以聚类-蒸馏方式将局部语义块合并为紧凑原型，并保留必要索引供后续恢复。
-
-\subsection{重访恢复机制}
-当检测到回环或语义重访时，系统根据检索键恢复对应语义块并进行轻量校正，以提升跨时段一致性并降低重复学习成本。
-
-\subsection{复杂度直觉}
-若原始状态复杂度为 $O(N)$，压缩后有效复杂度趋近 $O(N')$（$N'\ll N$）。在长时序场景下，该机制主要改善的是状态读写开销与误差累积斜率，而非单帧预测上限。
-
-\section{工程改造落点（基于 TTT3R）}
-
-为保证方案可执行，本文将改造点限定在已确认代码入口，避免“概念创新与工程实现脱节”。
-
-\begin{table}[h]
+\begin{table}[H]
 \centering
-\caption{核心工程改造锚点}
-\begin{tabular}{p{0.35\linewidth}p{0.58\linewidth}}
+\caption{五类 token 的职责划分}
+\label{tab:token-types}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.14\linewidth} >{\raggedright\arraybackslash}p{0.18\linewidth} X}
 \toprule
-文件/模块 & 改造要点 \\
+符号 & 名称 & 作用 \\
 \midrule
-\code{TTT3R/src/dust3r/model.py} & 扩展双状态结构；在 \code{model_update_type} 分支中加入语义门控更新；在 \code{update_mask} 逻辑处引入语义置信调制；将语义状态纳入 recurrent rollout 与 reset 机制。 \\
-\code{TTT3R/src/dust3r/inference.py} & 对 \code{inference_step}、\code{inference_recurrent} 的状态传递接口进行双状态兼容改造，确保在线推理链路可携带语义状态。 \\
-\code{TTT3R/demo.py} & 暴露 \code{--model_update_type}、\code{update}、\code{reset_interval} 等开关，便于控制重访更新、冻结策略与长程评估脚本。 \\
-评估脚本层 & 在 relpose/depth 评估基础上新增重访一致性、语义保持率与预算效率统计，形成统一实验口径。 \\
+$P_t$ & observation tokens & 来自当前帧的 patch/ray/point-level 观测 token，保留丰富局部信息，但生命周期较短 \\
+$A_t$ & anchor tokens & 从 observation 中晋升得到的局部稳定锚点，承载对位置、边界、结构或重访判别有帮助的线索 \\
+$H_t$ & active tokens & 活动层 persistent state 的基础单元，对应当前在线地图中的长期状态 \\
+$Z_j$ & archived summary tokens & 子图归档后的压缩摘要 token，用于索引、检索与恢复 \\
+$Q$ & query tokens & 用于按任务读取记忆的查询 token，包括 $q_{\text{pose}}$、$q_{\text{geo}}$、$q_{\text{desc}}$、$q_{\text{sum}}$ \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{table}
 
-\section{ZipMap 未开源条件下的复现策略}
+\subsection{短程层：VGGT 风格局部高精度 + LoGoPlanner 风格查询读出}
 
-\subsection{可复现声明}
-本项目不依赖 ZipMap 私有实现细节，采用“思想复现”策略：复现其线性状态读写与预算友好设计原则，而非声称对其源码的逐行重构。
+\subsubsection{短程层结构}
 
-\subsection{公平比较原则}
-比较时遵循统一训练预算、统一评测协议与统一硬件约束，报告中明确区分“公开实现基线”与“思想复现模块”，避免不公平对比。
-
-\section{实验设计}
-
-\subsection{数据与任务}
+短程层的目标不是替代活动层，而是用有限窗口保存最近观测的高分辨率几何细节。其结构定义为
+\begin{equation}
+M_{\text{short}}^t = \{L_{\text{recent}}^t,\; A_{\text{short}}^t,\; Q_{\text{short}}\},
+\end{equation}
+其中：
 \begin{itemize}
-  \item 几何任务：相机轨迹估计与深度/点云重建；
-  \item 语义任务：跨时段语义保持与重访一致性；
-  \item 场景类型：室内外混合、动态与遮挡条件并存。
+  \item $L_{\text{recent}}^t$ 为最近 $W$ 帧的 live tokens；
+  \item $A_{\text{short}}^t$ 为窗口内部已晋升的局部 anchors；
+  \item $Q_{\text{short}}$ 为用于局部读出的 query tokens 集合。
 \end{itemize}
 
-\subsection{指标体系}
+\subsubsection{输入编码与局部工作流}
+
+每个时间步中，短程层执行以下过程：
+\begin{enumerate}
+  \item \textbf{编码：}
+  \begin{equation}
+  P_t = \mathrm{Enc}(x_t, r_t, \pi_t),
+  \end{equation}
+  其中 $r_t$ 为几何或射线先验，$\pi_t$ 为位姿/尺度相关先验。
+
+  \item \textbf{追加到短程缓存：} 将 $P_t$ 写入 $L_{\text{recent}}^t$。
+
+  \item \textbf{LoGoPlanner 风格 query-based readout：}
+  \begin{equation}
+  z_{\text{pose}}^t = \mathrm{Attn}(q_{\text{pose}}, L_{\text{recent}}^t \cup A_{\text{short}}^t),
+  \end{equation}
+  \begin{equation}
+  z_{\text{geo}}^t = \mathrm{Attn}(q_{\text{geo}}, L_{\text{recent}}^t \cup A_{\text{short}}^t),
+  \end{equation}
+  \begin{equation}
+  d_t = \mathrm{Proj}\!\left(\mathrm{Attn}(q_{\text{desc}}, L_{\text{recent}}^t \cup A_{\text{short}}^t)\right).
+  \end{equation}
+  这一步的核心思想来自 LoGoPlanner：\textbf{不是把所有历史 token 原样传给下游，而是让不同 query 从几何记忆中按任务读取摘要。}
+
+  \item \textbf{anchor 晋升：} 当某些 observation token 在多帧支持下表现出较高区分性与稳定性时，将其晋升为 anchor：
+  \begin{equation}
+  m_{\text{promote}}(i)=\mathbb{I}[s_{\text{import}}(i)>\tau_s \land \mathrm{support}(i)>\tau_k].
+  \end{equation}
+
+  \item \textbf{局部驱逐：} 对短期 live tokens 执行受预算约束的删减，确保窗口成本稳定。
+\end{enumerate}
+
+\subsubsection{VGGT 在短程层中的作用}
+
+VGGT 在本项目中不作为全局 backbone，而作为\textbf{事件触发的局部高质量几何求解器}。我们只在以下情况下调用 VGGT 或 VGGT 风格局部 refine：
 \begin{itemize}
-  \item 几何指标：ATE、RPE、深度误差；
-  \item 语义指标：mIoU、重访语义一致率、语义漂移率；
-  \item 系统指标：显存峰值、吞吐、平均时延、状态容量利用率。
+  \item 短程窗口累计到固定关键帧数；
+  \item 当前局部歧义强，$u_t$ 上升；
+  \item 当前置信度下降，怀疑活动状态无法正确整合新信息；
+  \item 出现疑似重访，需要用高质量局部几何进行验证。
 \end{itemize}
 
-\subsection{核心消融矩阵}
-\begin{table}[h]
+VGGT 局部模块的输出包括：
+\begin{itemize}
+  \item 局部高精度相机与 point map；
+  \item 更稳定的局部几何摘要 $z_{\text{geo}}^t$；
+  \item 更可区分的重访描述子 $d_t$；
+  \item 对候选增量 $\Delta_t$ 的局部修正。
+\end{itemize}
+
+这意味着 VGGT 的职责是“\textbf{把最近这段看清楚}”，而不是“接管长程在线记忆”。
+
+\subsection{活动层：TTT3R 风格写入 + OVGGT 风格预算控制}
+
+\subsubsection{活动层结构}
+
+活动层是系统的实时主路径，定义为
+\begin{equation}
+M_{\text{active}}^t = \{A_{\text{active}}^t,\; C_{\text{active}}^t\},
+\end{equation}
+其中：
+\begin{itemize}
+  \item $A_{\text{active}}^t$ 表示较慢更新、偏稳定的 anchor state；
+  \item $C_{\text{active}}^t$ 表示较快更新、偏适应性的 context state。
+\end{itemize}
+
+这种双速率设计的动机是：若所有长期状态以同样速度更新，要么过快导致遗忘，要么过慢导致无法适应新观测。
+
+\subsubsection{TTT3R 风格的写入规则}
+
+我们保留 TTT3R 的核心思想：用新观测与当前记忆的一致性来控制写入强度，而不是使用固定更新率。设基础写入掩码为 $m_{\text{base}}^t$，则实际写入率为
+\begin{equation}
+m_{\text{write}}^t = m_{\text{base}}^t \cdot \mathrm{clip}(c_{\text{align}}^t, 0, 1).
+\end{equation}
+
+在此基础上，对 anchor 与 context 使用不同更新速率：
+\begin{equation}
+A_{\text{active}}^{t+1} = (1-\alpha_{\text{anchor}}m_{\text{write}}^t)\odot A_{\text{active}}^t + \alpha_{\text{anchor}}m_{\text{write}}^t \odot \Delta_{\text{anchor}}^t,
+\end{equation}
+\begin{equation}
+C_{\text{active}}^{t+1} = (1-\alpha_{\text{ctx}}m_{\text{write}}^t)\odot C_{\text{active}}^t + \alpha_{\text{ctx}}m_{\text{write}}^t \odot \Delta_{\text{ctx}}^t,
+\end{equation}
+并约束
+\begin{equation}
+\alpha_{\text{anchor}} < \alpha_{\text{ctx}}.
+\end{equation}
+
+直观上，anchor state 更保守，context state 更灵活。这样既能继承 TTT3R 的长度泛化优势，也能减少单状态被不断覆盖的问题。
+
+\subsubsection{OVGGT 风格的重要性评分与 anchor 保护}
+
+活动层不是无限扩张的。我们在此引入 OVGGT 风格的训练无关缓存维护原则，为每个 token 计算重要性分数：
+\begin{equation}
+\mathrm{score}_i = \lambda_r r_i + \lambda_a a_i + \lambda_g g_i + \lambda_c c_i + \lambda_v v_i,
+\end{equation}
+其中：
+\begin{itemize}
+  \item $r_i$ 表示 recency；
+  \item $a_i$ 表示是否为 anchor 或是否被多次 query 读出；
+  \item $g_i$ 表示几何支撑强度，例如跨帧支持、重投影稳定性；
+  \item $c_i$ 表示置信度；
+  \item $v_i$ 表示该 token 在重访验证、分支消歧等关键事件中的参与程度。
+\end{itemize}
+
+基于该分数，路由器对 token 执行四类动作：
+\begin{equation}
+\mathrm{action}_i \in \{\text{keep}, \text{promote}, \text{archive}, \text{evict}\}.
+\end{equation}
+
+同时，对被判定为 coordinate-critical 的 anchor 执行保护，即便总体预算紧张也不优先删除。这一设计借鉴 OVGGT 的 Dynamic Anchor Protection，其意义在于：
+\begin{quote}
+在线几何系统中最不应该被预算机制误删的，不是“最老的 token”，而是“最能维持坐标与身份稳定的 token”。
+\end{quote}
+
+\subsection{归档层：MERG3R 风格子图组织、检索与恢复}
+
+\subsubsection{子图表示}
+
+归档层不是简单地把活动状态扔掉，而是把已经离开的区域组织成可检索子图。每个归档子图定义为
+\begin{equation}
+B_j = \{d_j,\; z_j,\; A_j,\; T_j,\; w_j,\; \mu_j\},
+\end{equation}
+其中：
+\begin{itemize}
+  \item $d_j$ 是检索描述子；
+  \item $z_j$ 是压缩后的子图摘要；
+  \item $A_j$ 是子图中的关键 anchors；
+  \item $T_j$ 是子图局部坐标变换与锚定位姿；
+  \item $w_j$ 是子图置信度与可靠性统计；
+  \item $\mu_j$ 是元信息，如时间段、场景编号、重访次数、覆盖范围等。
+\end{itemize}
+
+\subsubsection{LoGoPlanner 风格的摘要形成}
+
+归档不是做简单平均池化，而是使用 query-based summarization。对即将关闭的活动子图，先形成
+\begin{equation}
+U_j = \{S_{\text{active}}^j,\; A_{\text{active}}^j,\; T_j\},
+\end{equation}
+再用摘要 query 计算：
+\begin{equation}
+z_j = \mathrm{Pool}_Q(q_{\text{sum}}, U_j), \qquad d_j = \mathrm{Proj}(z_j).
+\end{equation}
+
+这里，LoGoPlanner 的思想再次发挥作用：\textbf{摘要应由任务相关查询读出，而非无差别压缩。}
+
+\subsubsection{归档触发与恢复触发}
+
+归档触发可定义为
+\begin{equation}
+\mathcal{T}_{\text{archive}}(t)=\mathbb{I}[b_t>\tau_b \lor o_t<\tau_o \lor a_t>\tau_a],
+\end{equation}
+其中：
+\begin{itemize}
+  \item $b_t$ 表示预算压力；
+  \item $o_t$ 表示当前区域与活动层核心区域的 overlap；
+  \item $a_t$ 表示活动子图的年龄或生命周期。
+\end{itemize}
+
+重访恢复触发可定义为
+\begin{equation}
+\mathcal{T}_{\text{retrieve}}(t,j)=\mathbb{I}\left[\cos(d_t,d_j)>\tau_r \land \mathrm{GeoVerify}(t,j)=1\right].
+\end{equation}
+
+一旦触发恢复，执行如下流程：
+\begin{enumerate}
+  \item 使用当前描述子 $d_t$ 从 $B_{\text{bank}}$ 中检索 top-$k$ 候选子图；
+  \item 结合局部几何与位姿一致性进行验证；
+  \item 将通过验证的 $(A_j, z_j)$ 注入当前活动层作为 prior；
+  \item 在当前短程窗口上做一次局部 refine；
+  \item 必要时触发 MERG3R 风格的 overlap alignment 与 confidence-weighted merge。
+\end{enumerate}
+
+\subsubsection{MERG3R 在归档层中的作用}
+
+MERG3R 在本项目里不被视作每帧运行的 backbone，而是\textbf{后台地图整理器}。它解决的是：
+\begin{itemize}
+  \item 当单一活动窗口已经离开某区域时，如何把该区域压成一个可管理的子图；
+  \item 当多个历史子图存在 overlap 时，如何做全局对齐与合并；
+  \item 当重访发生时，如何以子图为单位恢复，而不是从零开始重新估计。
+\end{itemize}
+
+因此，MERG3R 的职责是“\textbf{把很长的历史组织起来并在需要时找回来}”。
+
+\subsection{路由器：统一管理写入、保留、归档与恢复}
+
+路由器并非一开始就设计为完全学习得到的大黑盒，而是一个\textbf{规则优先、可逐步学习化}的控制模块。其输入包括：
+\begin{itemize}
+  \item 对齐置信度 $c_{\text{align}}^t$；
+  \item token 重要性分数 $s_{\text{import}}^t$；
+  \item 当前局部歧义度 $u_t$；
+  \item 预算压力 $b_t$；
+  \item 重访候选得分；
+  \item 场景切换与 overlap 统计。
+\end{itemize}
+
+路由器输出四类决策：
+\begin{enumerate}
+  \item \textbf{write}：是否将当前候选增量写入活动层；
+  \item \textbf{keep/evict}：活动 token 如何裁剪；
+  \item \textbf{archive}：是否关闭当前活动子图并归档；
+  \item \textbf{retrieve}：是否从归档层恢复历史子图。
+\end{enumerate}
+
+本项目早期采用显式事件触发规则：
+\begin{itemize}
+  \item 若 $c_{\text{align}}^t$ 高且预算允许，则优先写入；
+  \item 若 $u_t$ 高，则触发短程局部 refine；
+  \item 若 $b_t$ 高，则优先执行 keep/evict/anchor protection；
+  \item 若检索相似度高且几何验证通过，则触发 retrieve；
+  \item 若已明显离开当前区域，则触发 archive。
+\end{itemize}
+
+\subsection{五条技术线在本项目中的最终分工}
+
+\begin{table}[H]
 \centering
-\caption{建议消融矩阵}
-\begin{tabular}{p{0.36\linewidth}p{0.56\linewidth}}
+\caption{TTT3R、VGGT、OVGGT、MERG3R 与 LoGoPlanner 的职责划分}
+\label{tab:role-split}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.18\linewidth}X}
 \toprule
-实验项 & 对比设置 \\
+技术线 & 在本项目中的职责 \\
 \midrule
-状态结构消融 & 单状态 / 双状态（仅几何 / 几何+语义） \\
-更新策略消融 & 固定更新 / 门控更新 / 门控+置信调制 \\
-压缩策略消融 & 无压缩 / 周期压缩 / 事件触发压缩 \\
-重访恢复消融 & 无恢复 / 检索恢复 / 检索恢复+轻量校正 \\
-预算鲁棒性 & 不同状态上限与延迟预算下的性能-开销曲线 \\
+TTT3R & 负责在线主路径的 active-state 更新规则，解决“怎么稳定写入” \\
+VGGT & 负责短程窗口内的高质量局部几何推理，解决“最近这段怎么更准确” \\
+OVGGT & 负责预算受限下的 keep/evict 与 anchor protection，解决“哪些必须留下，哪些可以丢” \\
+MERG3R & 负责归档子图的组织、对齐、合并与重访恢复，解决“历史怎么存得下、找得回” \\
+LoGoPlanner & 负责 query-based token readout 与 summary formation，解决“记忆怎么被读成有用的局部状态、描述子和摘要” \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{table}
 
-\section{风险与应对}
+\section{两级实现路线：最小可行版本与完整版本}
+
+\subsection{最小可行版本（建议先完成）}
+
+考虑到项目周期与工程复杂度，本项目的第一阶段不建议一开始就集成全部外部模型，而应先完成一个\textbf{最小可行版本}：
+\begin{enumerate}
+  \item 保留当前 TTT3R backbone 与 checkpoint；
+  \item 增加结构化的状态表示与路由器；
+  \item 引入 OVGGT 风格的重要性评分和 anchor 保护；
+  \item 引入最简单的 submap bank；
+  \item 实现基于 $q_{\text{desc}}$ 与 $q_{\text{sum}}$ 的归档、检索和恢复；
+  \item 在现有官方评测基础上加入长程 stress tests。
+\end{enumerate}
+
+该版本的优点是：
 \begin{itemize}
-  \item \textbf{语义噪声累积风险}：通过门控阈值、置信退火与跨时序一致性正则降低误写回概率。
-  \item \textbf{几何与语义耦合冲突}：采用分阶段权重调度，先稳几何后强化语义。
-  \item \textbf{重访检测误触发}：结合几何回环候选与语义检索双重确认，降低误恢复。
-  \item \textbf{实验可复现风险}：提供固定随机种子、统一配置模板与完整消融脚本。
+  \item 不需要重新训练大模型；
+  \item 能较早得到可验证的消融结果；
+  \item 能直接回答“persistent memory 是否真的有必要”。
 \end{itemize}
 
-\section{里程碑（8--10 周）}
+\subsection{完整版本（作为扩展目标）}
+
+在最小可行版本稳定后，再逐步扩展到完整版本：
+\begin{enumerate}
+  \item 引入实际的 VGGT 局部模块或其等价局部多视图 refine；
+  \item 在归档层加入更接近 MERG3R 的 overlap alignment 与 confidence-weighted merge；
+  \item 若需要，再尝试把规则路由器逐步替换为轻量 learned router；
+  \item 进一步探索表示层解耦，例如将分层记忆实例化到 Gaussian submap。
+\end{enumerate}
+
+\subsection{表示层策略：先解耦系统问题，再考虑高斯实例化}
+
+本项目的主问题是\textbf{记忆系统设计}，不是场景表示本身。因此方法应该与表示层解耦：
 \begin{itemize}
-  \item 第 1--2 周：完成双状态接口与基础门控更新，打通训练/推理链路。
-  \item 第 3--4 周：完成语义状态压缩与重访恢复原型，实现端到端运行。
-  \item 第 5--6 周：执行完整消融实验，收集性能-预算曲线。
-  \item 第 7--8 周：完成误差分析、可视化与报告主体撰写。
-  \item 第 9--10 周：补充对比实验、完善论文叙事与开源文档。
+  \item 第一阶段以 point map / depth / latent state 为主；
+  \item 第二阶段可以选择性地实例化到 Gaussian submap；
+  \item 不建议在项目早期同时切换到新的 GS 优化框架，否则会把重点从“长期记忆”转移到“渲染与 densification 细节”。
+\end{itemize}
+
+换言之，本项目的命题应当是：
+\begin{quote}
+我们不是在提出新的表示，而是在提出一种\textbf{适用于在线三维重建的分层记忆系统}；Gaussian 只是未来可能的载体之一。
+\end{quote}
+
+\section{训练与优化策略}
+
+\subsection{阶段一：训练无关改造}
+
+项目初期尽量坚持训练无关策略，原因有三：
+\begin{itemize}
+  \item 可以最大限度复用 TTT3R 已有 checkpoint；
+  \item 便于将改进归因于状态管理而不是重新训练；
+  \item 更容易做干净的消融对比。
+\end{itemize}
+
+此阶段主要依赖：
+\begin{itemize}
+  \item TTT3R 风格写入率；
+  \item OVGGT 风格重要性评分与 anchor 保护；
+  \item MERG3R 风格子图组织与对齐；
+  \item LoGoPlanner 风格 query-based summary。
+\end{itemize}
+
+\subsection{阶段二：若需要再引入训练目标}
+
+如果项目后期需要进一步提升性能，可定义联合损失：
+\begin{equation}
+\mathcal{L}_{\text{total}} =
+\lambda_{\text{pose}}\mathcal{L}_{\text{pose}} +
+\lambda_{\text{depth}}\mathcal{L}_{\text{depth}} +
+\lambda_{\text{recon}}\mathcal{L}_{\text{recon}} +
+\lambda_{\text{rev}}\mathcal{L}_{\text{rev}} +
+\lambda_{\text{budget}}\mathcal{L}_{\text{budget}},
+\end{equation}
+其中：
+\begin{itemize}
+  \item $\mathcal{L}_{\text{pose}}$ 约束局部和全局位姿稳定；
+  \item $\mathcal{L}_{\text{depth}}$ 约束逐帧深度质量；
+  \item $\mathcal{L}_{\text{recon}}$ 约束点云/重建精度与完整度；
+  \item $\mathcal{L}_{\text{rev}}$ 约束重访恢复后的一致性；
+  \item $\mathcal{L}_{\text{budget}}$ 约束活动层和归档层的容量。
+\end{itemize}
+
+在本 proposal 中，我们不把重新训练设为第一目标；重新训练只作为扩展选项。
+
+\section{评测方案}
+
+\subsection{TTT3R 已经证明了什么}
+
+TTT3R 官方评测已经提供了三条成熟基线：
+\begin{enumerate}
+  \item \textbf{Camera Pose Estimation}：以 ATE、RPE trans、RPE rot 为核心指标；
+  \item \textbf{Video Depth}：以 Abs Rel、Sq Rel、RMSE、Log RMSE、$\delta < 1.25$ 等为核心指标；
+  \item \textbf{3D Reconstruction}：以 Acc、Comp、NC 等点云与表面一致性指标为核心指标。
+\end{enumerate}
+
+这说明本项目的主 quantitative evaluation 不需要先搬到 ROS 或 IsaacLab 才成立。相反，最稳妥的路线是：
+\begin{quote}
+先在公开数据集上证明“同一 backbone 下，仅靠更好的记忆维护就能改善长程退化”，再考虑仿真或 bag 级 demo。
+\end{quote}
+
+\subsection{基础 benchmark 与标准指标}
+
+\begin{table}[H]
+\centering
+\caption{建议保留的基础 benchmark}
+\label{tab:benchmarks}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.20\linewidth} >{\raggedright\arraybackslash}p{0.28\linewidth} X}
+\toprule
+任务 & 数据集 & 指标 \\
+\midrule
+Pose / RelPose & ScanNet、TUM-dynamics、Sintel & ATE、RPE trans、RPE rot、每 100 帧漂移率 \\
+Video Depth & KITTI、Bonn、Sintel & Abs Rel、Sq Rel、RMSE、Log RMSE、$\delta < 1.25$ \\
+3D Reconstruction & 7Scenes、可扩展到 NRGBD & Acc、Comp、NC、FPS、显存占用 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+除了平均值，本项目必须重点报告\textbf{指标随序列长度变化的曲线}，因为我们的主张不是短序列精度，而是长序列退化更慢。
+
+\subsection{四组长期记忆 stress tests}
+
+为了回答“persistent memory 是否有必要”，我们将把老师给出的四类导航式测试翻译为适用于在线重建的实验协议。
+
+\subsubsection{任务组 1：Horizon Scaling}
+
+\textbf{设置：}
+在相同 simulator 或相同真实场景分布下，将序列切成不同 horizon 档位，例如 50、100、200、400、800、1000 帧，或按实际路径长度分成 4--10m、10--20m、20--40m、40m+。
+
+\textbf{检验问题：}
+系统性能是否会随着序列增长出现系统性退化。
+
+\textbf{主要指标：}
+\begin{itemize}
+  \item ATE / RPE 随序列长度的曲线；
+  \item depth RMSE 随序列长度的曲线；
+  \item reconstruction Acc / Comp 随序列长度的曲线；
+  \item peak VRAM、active token 数、bank 大小、FPS。
+\end{itemize}
+
+\textbf{希望证明的结论：}
+\method{} 的退化斜率小于 CUT3R/TTT3R baseline。
+
+\subsubsection{任务组 2：Branch Disambiguation}
+
+\textbf{设置：}
+构造重复走廊、相似房门、镜像岔路等局部视野高度相似而全局身份不同的场景。
+
+\textbf{检验问题：}
+固定容量历史压缩是否会丢失早期关键线索，导致全局身份混淆。
+
+\textbf{主要指标：}
+\begin{itemize}
+  \item branch confusion rate；
+  \item wrong relocalization rate；
+  \item top-$k$ retrieval recall；
+  \item 分支后 ATE / RPE；
+  \item 分支后地图错配率。
+\end{itemize}
+
+\textbf{希望证明的结论：}
+引入 submap archive + retrieve 后，系统在重复结构下的全局消歧能力更强。
+
+\subsubsection{任务组 3：Forced Backtracking（由 Hidden Detour 翻译而来）}
+
+\textbf{设置：}
+轨迹先远离目标区域，再绕行返回；或者人为截取“先背离、后回归”的观测序列。
+
+\textbf{检验问题：}
+系统是否只是依赖最近局部信息，还是能够在绕行后维持长期几何一致性。
+
+\textbf{注意：}
+由于本项目不是 planner，这一任务不应评估“规划是否最优”，而应评估\textbf{绕行轨迹下的建图与定位一致性}。
+
+\textbf{主要指标：}
+\begin{itemize}
+  \item 远离后返回时的 ATE / RPE；
+  \item 绕行过程中的 depth drift；
+  \item 返回后重访恢复是否使误差回落；
+  \item 子图检索是否成功命中旧区域。
+\end{itemize}
+
+\subsubsection{任务组 4：Revisit / Loop-closure}
+
+\textbf{设置：}
+要求轨迹多次穿越相似区域，或经过某区域后再回到该区域。
+
+\textbf{检验问题：}
+Persistent memory 是否对长距离重访具有不可替代性。
+
+\textbf{主要指标：}
+\begin{itemize}
+  \item revisit retrieval recall；
+  \item 恢复触发率与误触发率；
+  \item 恢复前后 ATE / RPE / depth drift 改善幅度；
+  \item loop consistency gain；
+  \item identity consistency。
+\end{itemize}
+
+\subsection{消融实验设计}
+
+为了保证结论可信，至少需要以下消融：
+\begin{enumerate}
+  \item \textbf{CUT3R baseline}；
+  \item \textbf{TTT3R baseline}；
+  \item \textbf{TTT3R + anchor protection}；
+  \item \textbf{TTT3R + submap bank}；
+  \item \textbf{TTT3R + submap bank + retrieval}；
+  \item \textbf{\method{} 完整版}；
+  \item 去掉 query-based summary，改用简单平均池化；
+  \item 去掉 archive，仅保留 active-state；
+  \item 去掉 anchor protection，仅做 budget 剪枝；
+  \item 去掉 VGGT 局部 refine，仅依赖短程缓存。
+\end{enumerate}
+
+\subsection{为什么不把 ROS bag 或 IsaacLab 作为主评测}
+
+本项目的主张是“在线重建的长期记忆与子图恢复”，不是“闭环控制质量”。因此：
+\begin{itemize}
+  \item \textbf{公开数据集应该是主 quantitative 评测。} 这样便于和 TTT3R 的官方口径一致，也便于追踪精确 GT。
+  \item \textbf{ROS bag 更适合做 demo，不适合做主证据。} 很多 bag 缺乏稳定的 dense GT，适合展示，不适合做主表格。
+  \item \textbf{IsaacLab 可用于后期构造可控 stress test。} 如果需要批量生成重复走廊、强重访、强绕行序列，IsaacLab 是可选项，但不应在项目早期成为阻塞项。
+\end{itemize}
+
+\subsection{成功标准}
+
+本项目的成功不以“是否引入了更多模块”评判，而以以下结果为标准：
+\begin{enumerate}
+  \item 在 long-horizon 序列上，\method{} 的 ATE / RPE / depth drift 退化曲线明显优于 TTT3R baseline；
+  \item 在 Branch Disambiguation 与 Revisit 任务上，retrieve/recover 机制带来可测改善；
+  \item 在固定预算下，VRAM 与 active token 数保持有界增长；
+  \item 消融能够证明每个模块的作用，而不是所有提升都来自更重的计算。
+\end{enumerate}
+
+\section{在当前代码库中的落地方案}
+
+\subsection{现有工程基础}
+
+当前仓库中已经具备以下优势：
+\begin{itemize}
+  \item TTT3R 主干与 checkpoint 已经就绪；
+  \item 官方 pose / depth / reconstruction 评测脚本已经存在；
+  \item 现有代码已经有 model update type 的切换逻辑，适合做状态更新方案对比。
+\end{itemize}
+
+因此，项目不需要从零搭建系统，而应围绕现有代码做结构化扩展。
+
+\subsection{建议新增的模块文件}
+
+建议在 \code{CVPR/TTT3R/src/dust3r/} 下增加以下模块：
+\begin{itemize}
+  \item \code{hier_state.py}：定义 $M_{\text{short}}$、$M_{\text{active}}$、$B_{\text{bank}}$ 的数据结构；
+  \item \code{memory_router.py}：实现 write / keep / archive / retrieve 的规则路由器；
+  \item \code{submap_bank.py}：实现归档子图的存储、检索、恢复；
+  \item \code{revisit.py}：实现 $q_{\text{desc}}$、几何验证和恢复注入；
+  \item \code{importance.py}：实现 OVGGT 风格的重要性评分与 anchor protection；
+  \item \code{local_refine.py}：实现短程局部 refine 接口，先用轻量版本，后续再接入 VGGT 风格模块。
+\end{itemize}
+
+\subsection{分阶段实现计划}
+
+\begin{table}[H]
+\centering
+\caption{建议的六阶段工程计划}
+\label{tab:milestones}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.10\linewidth} >{\raggedright\arraybackslash}p{0.24\linewidth} X}
+\toprule
+阶段 & 目标 & 具体工作 \\
+\midrule
+P1 & 跑通基线评测 & 复现实验脚本，记录 TTT3R 在不同 horizon 下的曲线，建立对照组 \\
+P2 & 状态结构化 & 引入 \code{hier_state.py} 与基础路由器，显式区分 short / active / bank \\
+P3 & 预算控制 & 实现 importance scoring、anchor protection 与 keep/evict 逻辑 \\
+P4 & 子图归档与恢复 & 实现 \code{submap_bank.py}、粗检索、几何验证、恢复注入 \\
+P5 & 长程 stress tests & 实现 Horizon Scaling、Branch、Forced Backtracking、Revisit 评测脚本 \\
+P6 & 局部 refine 扩展 & 接入 VGGT 风格局部 refine，完善消融与最终报告 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{最先应完成的三件事}
+
+从项目管理角度看，最应优先完成的是：
+\begin{enumerate}
+  \item \textbf{先有 eval，再做改动。} 若没有长程评测曲线，继续改代码没有判断依据。
+  \item \textbf{先做 submap bank 原型，再考虑更强局部模块。} 因为 persistent memory 的必要性首先要在 Revisit/Branch 上被验证。
+  \item \textbf{先用规则路由，再考虑 learned router。} 项目早期不建议把不确定性又引入控制层。
+\end{enumerate}
+
+\section{风险分析与应对策略}
+
+\subsection{主要风险}
+
+\begin{enumerate}
+  \item \textbf{系统过大，无法在课程周期内完成。} 如果同时接入 TTT3R、VGGT、MERG3R、LoGoPlanner、GS 表示，项目会迅速失控。
+  \item \textbf{改了代码但没有明确收益。} 若没有 long-horizon 与 revisit 评测，系统可能越改越复杂但无法证明改进。
+  \item \textbf{路由器过于拍脑袋。} 如果控制逻辑没有依据，结果很可能不稳定。
+  \item \textbf{实际问题不在重访，而在局部几何本身。} 若 baseline 失败主要来自局部几何太差，那么先做记忆系统也可能收效有限。
+\end{enumerate}
+
+\subsection{风险缓解}
+
+\begin{itemize}
+  \item 用\textbf{最小可行版本}控制项目规模；
+  \item 先用\textbf{TTT3R 官方评测 + 四组 stress tests}建立证据链；
+  \item 路由器优先采用\textbf{TTT3R + OVGGT} 风格的规则组合，而不是大黑盒；
+  \item 若发现局部几何是瓶颈，再增量接入 VGGT 局部 refine，而不是一开始就做大集成。
+\end{itemize}
+
+\section{预期贡献与最终交付}
+
+\subsection{学术贡献}
+
+若项目按计划完成，预期贡献可以表述为：
+\begin{enumerate}
+  \item 提出一个\textbf{面向长时程在线三维重建的分层记忆框架}，将单一 recurrent state 扩展为短程层、活动层与归档层。
+  \item 将\textbf{TTT3R 的 confidence-aware 写入、OVGGT 的预算控制、MERG3R 的子图组织、LoGoPlanner 的 query-based readout}统一到一个在线建图系统中。
+  \item 建立一套\textbf{适用于在线重建的长期记忆评测协议}，重点覆盖 Horizon Scaling、Branch Disambiguation、Forced Backtracking 与 Revisit/Loop-closure。
+\end{enumerate}
+
+\subsection{工程交付}
+
+最终交付物应至少包括：
+\begin{itemize}
+  \item 一个可以在当前 TTT3R 仓库中运行的分层记忆原型；
+  \item 一套可重复运行的 long-horizon 与 revisit 评测脚本；
+  \item 消融实验结果与最终曲线；
+  \item 一份说明项目边界、方法细节、实验设计和实现计划的完整报告。
 \end{itemize}
 
 \section{结论}
-本文计划以 TTT3R 为工程主底座，构建语义-几何双状态线性 SLAM 框架。其核心价值不在于单一技巧堆叠，而在于将语义记忆、门控更新、压缩恢复与预算评估整合为统一系统机制。若实验验证成立，该方案有望在长期一致性与资源效率之间取得更优折中，并形成可发表、可复现的研究结果。
 
-\begin{thebibliography}{99}
+本 proposal 的核心立场是：\textbf{当前在线三维重建真正缺的是长期记忆组织能力，而不是再多接一个语义头。} TTT3R 已经证明测试时状态更新规则可以显著提升长度泛化，但单一活动状态仍无法同时承担局部精度、长期保留、预算受限压缩和重访恢复四类职责。因此，我们提出 \method{} 这一分层记忆方案：用 TTT3R 保持实时主路径，用 VGGT 处理局部高精度，用 OVGGT 进行预算控制与 anchor 保护，用 MERG3R 管理子图归档与恢复，并用 LoGoPlanner 的 query-based 思路把几何记忆读成可用的局部状态、检索描述子和摘要表示。
 
-\bibitem{ttt3r2025}
-Y. Rao, et al.
-\newblock TTT3R: Test-Time Training for 3D Reconstruction.
-\newblock arXiv preprint, 2025.
+如果该方案在官方 benchmark 与四组 stress tests 上得到验证，那么它的意义并不在于“做了一个更复杂的系统”，而在于证明了一件更基础的事情：
+\begin{quote}
+在线三维重建要想真正走向长时程，不仅要会重建，还要会\textbf{记住、保留、压缩、找回}。
+\end{quote}
 
-\bibitem{merg3r2026}
-M. Keetha, et al.
-\newblock MERG3R: Divide, Compress, and Recover for Long-Horizon 3D Reconstruction.
-\newblock arXiv preprint, 2026.
+\section*{参考文献与在线资源}
 
-\bibitem{zipmap2026}
-A. Eftekhar, et al.
-\newblock ZipMap: Revisiting Linearized State Space Models for Real-Time Dense Mapping.
-\newblock arXiv preprint, 2026.
-
-\bibitem{semanticfusion2017}
-J. McCormac, et al.
-\newblock SemanticFusion: Dense 3D Semantic Mapping with Convolutional Neural Networks.
-\newblock ICRA, 2017.
-
-\bibitem{dynaslam2018}
-B. Bescos, et al.
-\newblock DynaSLAM: Tracking, Mapping and Inpainting in Dynamic Scenes.
-\newblock RA-L/ICRA, 2018.
-
-\bibitem{dsslam2018}
-C. Yu, et al.
-\newblock DS-SLAM: A Semantic Visual SLAM towards Dynamic Environments.
-\newblock IROS, 2018.
-
-\bibitem{panopticfusion2019}
-T. M. Nguyen, et al.
-\newblock PanopticFusion: Online Volumetric Semantic Mapping at the Level of Stuff and Things.
-\newblock ICRA, 2019.
-
-\bibitem{kimera2020}
-A. Rosinol, et al.
-\newblock Kimera: an Open-Source Library for Real-Time Metric-Semantic Localization and Mapping.
-\newblock ICRA, 2020.
-
-\end{thebibliography}
+\begin{enumerate}
+  \item TTT3R: 3D Reconstruction as Test-Time Training. arXiv:2509.26645. \url{https://arxiv.org/abs/2509.26645}
+  \item VGGT: Visual Geometry Grounded Transformer. arXiv:2503.11651. \url{https://arxiv.org/abs/2503.11651}
+  \item Streaming 4D Visual Geometry Transformer. arXiv:2507.11539. \url{https://arxiv.org/abs/2507.11539}
+  \item OVGGT: O(1) Constant-Cost Streaming Visual Geometry Transformer. arXiv:2603.05959. \url{https://arxiv.org/abs/2603.05959}
+  \item MERG3R: A Divide-and-Conquer Approach to Large-Scale Neural Visual Geometry. arXiv:2603.02351. \url{https://arxiv.org/abs/2603.02351}
+  \item LoGoPlanner: Localization Grounded Navigation Policy with Metric-aware Visual Geometry. arXiv:2512.19629. \url{https://arxiv.org/abs/2512.19629}
+\end{enumerate}
 
 \end{document}
