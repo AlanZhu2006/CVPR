@@ -6,3 +6,8 @@ latex/*.fdb_latexmk
 latex/*.fls
 latex/*.synctex.gz
 TTT3R/demo_tmp/
+.venv-nuc/
+nuc_output/
+nuc/.cache/
+**/__pycache__/
+*.pyc

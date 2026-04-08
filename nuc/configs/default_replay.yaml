@@ -1,0 +1,37 @@
+input:
+  frame_step: 1
+  max_frames: 0
+  resize_width: 0
+  default_fps: 30.0
+
+tracking:
+  max_features: 2000
+  min_matches: 40
+  min_pose_inliers: 16
+  ratio_test: 0.75
+  min_keyframe_gap: 3
+  max_keyframe_gap: 15
+  keyframe_motion_threshold: 18.0
+  low_match_keyframe_threshold: 80
+  focal_length_scale: 0.9
+  min_translation_step: 0.05
+  max_translation_step: 0.5
+
+memory:
+  short_window_size: 20
+  active_max_keyframes: 12
+  active_max_age: 120
+  active_max_distance: 2.5
+  active_similarity_floor: 0.72
+  retrieve_topk: 3
+  retrieve_similarity_threshold: 0.82
+  retrieve_cooldown_frames: 20
+  geo_verify_min_matches: 25
+  enable_recover: true
+
+output:
+  output_dir: nuc_output/default_run
+  save_debug_video: true
+  save_keyframe_images: true
+  debug_video_fps: 10.0
+  debug_video_name: debug.mp4

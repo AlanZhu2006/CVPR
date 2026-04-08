@@ -1,0 +1,11 @@
+name: cvpr-nuc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26
+  - pyyaml=6.0
+  - tqdm=4.66
+  - pip:
+      - opencv-python-headless>=4.9,<5.0
