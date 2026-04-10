@@ -9,6 +9,7 @@ if [[ -d "$ROOT_DIR/.venv-nuc" ]]; then
 fi
 
 python - <<'PY'
+from importlib.metadata import version
 import platform
 import sys
 
@@ -21,4 +22,5 @@ print("platform:", platform.platform())
 print("opencv:", cv2.__version__)
 print("numpy:", numpy.__version__)
 print("pyyaml:", yaml.__version__)
+print("rosbags:", version("rosbags"))
 PY

@@ -13,7 +13,14 @@ except ModuleNotFoundError:  # pragma: no cover
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CPU-friendly NUC memory lifecycle prototype.")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config.")
-    parser.add_argument("--input", type=str, required=True, help="Input video path or image directory.")
+    parser.add_argument(
+        "--input",
+        type=str,
+        required=True,
+        help="Input video path, monocular image directory, stereo root directory, or rosbag path.",
+    )
+    parser.add_argument("--left-topic", type=str, default=None, help="Override rosbag left image topic.")
+    parser.add_argument("--right-topic", type=str, default=None, help="Override rosbag right image topic.")
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -39,6 +46,10 @@ def main() -> None:
     config = load_runtime_config(args.config)
     if args.output_dir:
         config.output.output_dir = args.output_dir
+    if args.left_topic:
+        config.input.rosbag_left_topic = args.left_topic
+    if args.right_topic:
+        config.input.rosbag_right_topic = args.right_topic
     if args.disable_recover:
         config.memory.enable_recover = False
 
@@ -55,6 +66,9 @@ def main() -> None:
         max_frames=config.input.max_frames,
         default_fps=config.input.default_fps,
         resize_width=config.input.resize_width,
+        rosbag_left_topic=config.input.rosbag_left_topic,
+        rosbag_right_topic=config.input.rosbag_right_topic,
+        rosbag_sync_tolerance_sec=config.input.rosbag_sync_tolerance_sec,
     )
 
     frame_count = 0

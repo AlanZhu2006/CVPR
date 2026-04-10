@@ -2,7 +2,7 @@
 
 这个目录把仓库整理成一套可以直接在 Intel NUC 上运行的第一阶段原型。目标不是复现最终 Jetson + Gaussian 系统，而是先把下面这条主链跑通：
 
-`image/video -> tracking -> pose/keyframe -> archive/retrieve/recover`
+`image/video/stereo-dir/rosbag -> tracking -> pose/keyframe -> archive/retrieve/recover`
 
 ## 1. 这套原型解决什么问题
 
@@ -53,6 +53,51 @@ bash nuc/scripts/run_nuc_replay.sh \
 
 如果输入是图片序列目录，也可以直接把 `/path/to/video.mp4` 换成目录路径。
 
+如果输入是双目目录，传根目录即可。当前会自动识别这些常见布局：
+
+```text
+/path/to/stereo_root/
+  left/*.png
+  right/*.png
+```
+
+```text
+/path/to/stereo_root/
+  image_0/*.png
+  image_1/*.png
+```
+
+```text
+/path/to/stereo_root/
+  cam0/data/*.png
+  cam1/data/*.png
+```
+
+双目模式下，系统会优先使用上一帧 stereo 深度做 `PnP`；如果 stereo 点不足，会自动回退到原来的单目估计。
+
+如果输入是 `rosbag`，当前支持：
+
+- `rosbag1`: `*.bag`
+- `rosbag2`: 带 `metadata.yaml` 的目录
+
+会优先自动识别这些常见双目 topic：
+
+- `/cam0/image_raw` + `/cam1/image_raw`
+- `/cam0/image_raw/compressed` + `/cam1/image_raw/compressed`
+- `/camera/left/image_raw` + `/camera/right/image_raw`
+- `/stereo/left/image_raw` + `/stereo/right/image_raw`
+
+也可以手动指定：
+
+```bash
+python3 nuc/tools/run_nuc_replay.py \
+  --config nuc/configs/default_replay.yaml \
+  --input /path/to/dataset.bag \
+  --left-topic /cam0/image_raw \
+  --right-topic /cam1/image_raw \
+  --output-dir nuc_output/bag_run
+```
+
 ## 4. 输出文件
 
 一次运行后，`output_dir` 里会生成：
@@ -93,14 +138,28 @@ python3 nuc/tools/compare_runs.py \
   --right nuc_output/recover_off/summary.json
 ```
 
+如果已经有多组 on/off 结果，建议直接用一键收口脚本：
+
+```bash
+bash nuc/scripts/close_phase6.sh
+```
+
+默认比较：
+
+- `recover_on` vs `recover_off`
+- `stereo_taylor_recover_on` vs `stereo_taylor_recover_off`
+- `westlake_recover_on` vs `westlake_recover_off`
+
+输出会写到 `nuc_output/phase6_closure_<timestamp>/`，包含总表 `phase6_summary.csv` 和可读报告 `phase6_report.md`。
+
 ## 6. 当前实现的模块映射
 
 - `nuc/src/nuc_runtime/tracking.py`
-  轻量 ORB tracking 前端，输出 `pose / keyframe`
+  轻量 ORB tracking 前端，支持单目回放和双目目录回放，输出 `pose / keyframe`
 - `nuc/src/nuc_runtime/memory_router.py`
   实现 `observe -> promote -> archive -> retrieve -> recover`
 - `nuc/src/nuc_runtime/io.py`
-  统一处理视频和图片序列输入
+  统一处理视频、图片序列、双目目录和 rosbag 输入
 - `nuc/src/nuc_runtime/output.py`
   统一落 `csv/jsonl/json/mp4`
 
@@ -109,6 +168,7 @@ python3 nuc/tools/compare_runs.py \
 这是一个 CPU 友好的系统原型，不是最终算法结果。你需要明确它的用途：
 
 - 它的 tracking 是替代前端，不是最终前端
+- 双目模式默认假设输入已经过左右校正，且使用近似内参和基线，不是严格标定后的 stereo VO
 - pose 是可用接口，不是高精度 SLAM 基准结果
 - recover 是“历史子图重新注入 active”的系统动作，不是高斯恢复
 - 它的价值在于验证 memory lifecycle，而不是重建画质

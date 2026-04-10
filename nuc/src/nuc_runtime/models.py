@@ -20,6 +20,8 @@ class FramePacket:
     timestamp_sec: float
     frame_bgr: np.ndarray
     source_name: str
+    frame_bgr_right: np.ndarray | None = None
+    right_source_name: str | None = None
 
 
 @dataclass

@@ -98,6 +98,22 @@
 - 输出统计可直接对比
 - 至少能明确看到 retrieve / recover 是否触发、触发频率如何
 
+建议收口命令（自动批量比较并输出报告）：
+
+- `bash nuc/scripts/close_phase6.sh`
+
+默认会比较这三组：
+
+- `recover_on` vs `recover_off`
+- `stereo_taylor_recover_on` vs `stereo_taylor_recover_off`
+- `westlake_recover_on` vs `westlake_recover_off`
+
+脚本会在 `nuc_output/phase6_closure_<timestamp>/` 生成：
+
+- `phase6_summary.csv`（总表，含 PASS/WARN）
+- `<on_run>__vs__<off_run>.csv`（逐组 compare_runs 输出）
+- `phase6_report.md`（可读报告）
+
 ## 第一周建议
 
 如果你只做一周，建议只锁这三件事：

@@ -13,6 +13,9 @@ class InputConfig:
     max_frames: int = 0
     resize_width: int = 0
     default_fps: float = 30.0
+    rosbag_left_topic: str | None = None
+    rosbag_right_topic: str | None = None
+    rosbag_sync_tolerance_sec: float = 0.01
 
 
 @dataclass
@@ -28,6 +31,12 @@ class TrackingConfig:
     focal_length_scale: float = 0.9
     min_translation_step: float = 0.05
     max_translation_step: float = 0.5
+    stereo_baseline_m: float = 0.11
+    stereo_ratio_test: float = 0.75
+    min_stereo_disparity: float = 1.0
+    max_stereo_vertical_diff: float = 2.0
+    min_stereo_points: int = 24
+    max_stereo_depth_m: float = 40.0
 
 
 @dataclass

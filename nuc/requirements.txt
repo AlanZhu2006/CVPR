@@ -2,3 +2,4 @@ numpy>=1.26,<2.0
 opencv-python-headless>=4.9,<5.0
 PyYAML>=6.0,<7.0
 tqdm>=4.66,<5.0
+rosbags>=0.11,<0.12

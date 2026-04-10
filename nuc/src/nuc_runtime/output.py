@@ -36,6 +36,8 @@ class ArtifactWriter:
                 "match_count",
                 "inlier_count",
                 "pixel_motion",
+                "tracking_mode",
+                "stereo_points",
                 "tx",
                 "ty",
                 "tz",
@@ -65,6 +67,8 @@ class ArtifactWriter:
                 "match_count": tracking.match_count,
                 "inlier_count": tracking.inlier_count,
                 "pixel_motion": f"{tracking.pixel_motion:.3f}",
+                "tracking_mode": tracking.notes.get("tracking_mode"),
+                "stereo_points": tracking.notes.get("stereo_points", 0),
                 "tx": f"{tx:.6f}",
                 "ty": f"{ty:.6f}",
                 "tz": f"{tz:.6f}",
@@ -106,6 +110,7 @@ class ArtifactWriter:
         lines = [
             f"frame={tracking.frame_idx} keyframe={int(tracking.is_keyframe)} track_ok={int(tracking.track_ok)}",
             f"matches={tracking.match_count} inliers={tracking.inlier_count} motion={tracking.pixel_motion:.2f}",
+            f"mode={tracking.notes.get('tracking_mode', '-')} stereo_pts={tracking.notes.get('stereo_points', 0)}",
             f"active={snapshot.get('active_id')} active_kf={snapshot.get('active_keyframes')} bank={snapshot.get('bank_size')}",
             f"recoveries={snapshot.get('recoveries')} last_event={last_event or '-'}",
         ]
