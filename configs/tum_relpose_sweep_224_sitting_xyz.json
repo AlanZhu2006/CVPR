@@ -1,0 +1,42 @@
+{
+  "weights": "checkpoints/cut3r_512_dpt_4_64.pth",
+  "dataset": "tum_s1_1000",
+  "output_root": "reports/generated/tum_relpose_sweep_224_sitting_xyz",
+  "size": 224,
+  "device": "cuda",
+  "max_seqs": 1,
+  "seq_list": [
+    "rgbd_dataset_freiburg3_sitting_xyz"
+  ],
+  "baseline_trial": "ttt3r_baseline",
+  "memory": {
+    "archive_interval": 120,
+    "max_archives": 64,
+    "retrieval_topk": 3,
+    "retrieval_similarity_thresh": 0.9,
+    "verification_similarity_thresh": 0.82,
+    "recovery_alpha": 0.5,
+    "min_frames_before_retrieve": 30,
+    "retrieval_cooldown": 30,
+    "base_update_type": "ttt3r"
+  },
+  "trials": [
+    {
+      "name": "ttt3r_baseline",
+      "mode": "ttt3r"
+    },
+    {
+      "name": "hmr_archive_only_default",
+      "mode": "hmr_archive_only"
+    },
+    {
+      "name": "hmr_full_strict_low_alpha",
+      "mode": "hmr_full",
+      "memory": {
+        "retrieval_similarity_thresh": 0.97,
+        "verification_similarity_thresh": 0.95,
+        "recovery_alpha": 0.2
+      }
+    }
+  ]
+}

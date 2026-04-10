@@ -1,0 +1,29 @@
+{
+  "weights": "checkpoints/cut3r_512_dpt_4_64.pth",
+  "dataset": "tum_s1_1000",
+  "output_root": "reports/generated/tum_relpose_mem3r_pose_probe_static",
+  "size": 224,
+  "device": "cuda",
+  "seed": 0,
+  "deterministic": true,
+  "max_seqs": 1,
+  "seq_list": [
+    "rgbd_dataset_freiburg3_sitting_static"
+  ],
+  "baseline_trial": "ttt3r_baseline",
+  "memory": {
+    "base_update_type": "ttt3r",
+    "fast_weight_decay": 0.995,
+    "fast_weight_lr": 0.001
+  },
+  "trials": [
+    {
+      "name": "ttt3r_baseline",
+      "mode": "ttt3r"
+    },
+    {
+      "name": "mem3r_pose_probe",
+      "mode": "mem3r_pose_probe"
+    }
+  ]
+}

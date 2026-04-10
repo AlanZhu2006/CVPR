@@ -1,0 +1,37 @@
+{
+  "weights": "checkpoints/cut3r_512_dpt_4_64.pth",
+  "seed": 0,
+  "deterministic": true,
+  "modes": [
+    "cut3r",
+    "ttt3r",
+    "hmr_archive_only",
+    "hmr_full"
+  ],
+  "relpose_datasets": [
+    "scannet_s3_1000",
+    "tum_s1_1000"
+  ],
+  "video_depth_datasets": [
+    "kitti_s1_500",
+    "bonn_s1_500"
+  ],
+  "memory": {
+    "archive_interval": 120,
+    "max_archives": 64,
+    "retrieval_topk": 2,
+    "retrieval_similarity_thresh": 0.92,
+    "verification_similarity_thresh": 0.8,
+    "max_state_similarity_for_recover": 0.995,
+    "query_state_gap_thresh": -0.05,
+    "recovery_alpha": 0.35,
+    "enable_geometric_verification": true,
+    "verification_geo_ratio_thresh": 1.0,
+    "verification_conf_tolerance": 0.1,
+    "min_frames_before_retrieve": 30,
+    "retrieval_cooldown": 30,
+    "retrieval_attempt_cooldown": 30,
+    "base_update_type": "ttt3r",
+    "reset_on_archive": false
+  }
+}

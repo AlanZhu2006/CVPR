@@ -1,0 +1,41 @@
+{
+  "weights": "checkpoints/cut3r_512_dpt_4_64.pth",
+  "dataset": "tum_s1_1000",
+  "output_root": "reports/generated/tum_relpose_sweep_224_v5_sequence_static",
+  "size": 224,
+  "device": "cuda",
+  "seed": 0,
+  "deterministic": true,
+  "max_seqs": 1,
+  "seq_list": [
+    "rgbd_dataset_freiburg3_sitting_static"
+  ],
+  "baseline_trial": "ttt3r_baseline",
+  "memory": {
+    "archive_interval": 120,
+    "max_archives": 64,
+    "retrieval_topk": 5,
+    "sequence_consistency_window": 3,
+    "sequence_similarity_thresh": 0.97,
+    "retrieval_similarity_thresh": 0.97,
+    "verification_similarity_thresh": 0.95,
+    "max_state_similarity_for_recover": 0.95,
+    "query_state_gap_thresh": 0.0,
+    "recovery_alpha": 0.2,
+    "min_frames_before_retrieve": 30,
+    "retrieval_cooldown": 30,
+    "retrieval_attempt_cooldown": 30,
+    "base_update_type": "ttt3r",
+    "reset_on_archive": false
+  },
+  "trials": [
+    {
+      "name": "ttt3r_baseline",
+      "mode": "ttt3r"
+    },
+    {
+      "name": "hmr_full_sequence_consistency",
+      "mode": "hmr_full"
+    }
+  ]
+}
