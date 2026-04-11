@@ -132,6 +132,56 @@ def compute_prediction_quality(
     }
 
 
+def extract_camera_pose_matrix(prediction: Dict[str, torch.Tensor]) -> torch.Tensor | None:
+    pose_encoding = prediction.get("camera_pose")
+    if pose_encoding is None:
+        return None
+    bootstrap_ttt3r_imports()
+    from dust3r.utils.camera import pose_encoding_to_camera
+
+    return pose_encoding_to_camera(pose_encoding.detach().clone())
+
+
+def compute_anchor_pose_score_from_matrices(
+    pred_camera_pose: torch.Tensor,
+    archive_camera_pose: torch.Tensor,
+    *,
+    rotation_weight: float = 0.25,
+) -> Dict[str, float]:
+    archive_camera_pose = archive_camera_pose.to(pred_camera_pose.device, dtype=pred_camera_pose.dtype)
+    relative = torch.linalg.inv(archive_camera_pose) @ pred_camera_pose
+    translation_error = relative[:, :3, 3].norm(dim=-1).mean().item()
+
+    rotation = relative[:, :3, :3]
+    trace = rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cosine = ((trace - 1.0) * 0.5).clamp(min=-1.0, max=1.0)
+    rotation_error = torch.arccos(cosine).mean().item()
+    anchor_score = translation_error + rotation_weight * rotation_error
+    return {
+        "anchor_translation_error": translation_error,
+        "anchor_rotation_error": rotation_error,
+        "anchor_score": anchor_score,
+    }
+
+
+def compute_anchor_pose_quality(
+    prediction: Dict[str, torch.Tensor],
+    archive_camera_pose: torch.Tensor | None,
+    *,
+    rotation_weight: float = 0.25,
+) -> Dict[str, float] | None:
+    if archive_camera_pose is None:
+        return None
+    pred_camera_pose = extract_camera_pose_matrix(prediction)
+    if pred_camera_pose is None:
+        return None
+    return compute_anchor_pose_score_from_matrices(
+        pred_camera_pose,
+        archive_camera_pose,
+        rotation_weight=rotation_weight,
+    )
+
+
 def prepare_relpose_output(outputs: Dict[str, List[Dict[str, torch.Tensor]]], revisit: int = 1, solve_pose: bool = False):
     bootstrap_ttt3r_imports()
     from dust3r.post_process import estimate_focal_knowing_depth

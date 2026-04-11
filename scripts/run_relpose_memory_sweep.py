@@ -55,6 +55,16 @@ def _build_row(
         "geometry_verification_accepts": summary.get("geometry_verification_accepts", 0),
         "geometry_verification_rejects": summary.get("geometry_verification_rejects", 0),
         "avg_geometry_verification_geo_gain": summary.get("avg_geometry_verification_geo_gain", 0.0),
+        "anchor_pose_verification_accepts": summary.get("anchor_pose_verification_accepts", 0),
+        "anchor_pose_verification_rejects": summary.get("anchor_pose_verification_rejects", 0),
+        "avg_anchor_pose_score_gain": summary.get("avg_anchor_pose_score_gain", 0.0),
+        "shadow_recovery_starts": summary.get("shadow_recovery_starts", 0),
+        "shadow_recovery_commits": summary.get("shadow_recovery_commits", 0),
+        "shadow_recovery_rejects": summary.get("shadow_recovery_rejects", 0),
+        "shadow_recovery_frames": summary.get("shadow_recovery_frames", 0),
+        "avg_shadow_recovery_geo_gain": summary.get("avg_shadow_recovery_geo_gain", 0.0),
+        "avg_shadow_recovery_conf_delta": summary.get("avg_shadow_recovery_conf_delta", 0.0),
+        "avg_shadow_recovery_frames": summary.get("avg_shadow_recovery_frames", 0.0),
         "recovery_success_rate": summary.get("recovery_success_rate", 0.0),
         "avg_best_similarity": summary.get("avg_best_similarity", 0.0),
         "avg_best_gap": summary.get("avg_best_gap", 0.0),
@@ -79,6 +89,7 @@ def _release_cuda_cache() -> None:
     except ImportError:
         return
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
 

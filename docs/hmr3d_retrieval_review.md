@@ -32,3 +32,24 @@ The current optimization adds counterfactual geometric verification:
 4. Accept recovery only if the candidate improves weighted geometric consistency without a large confidence drop.
 
 This keeps the system training-free while making the recover path closer to the coarse-to-fine verification pattern used in localization literature.
+
+## Current Extension: Shadow Recover
+
+The next step is a short shadow branch after geometric verification:
+
+1. Candidate passes the current-frame counterfactual geometric check.
+2. Candidate state is not committed immediately.
+3. Run the candidate state in parallel for a small future window.
+4. Commit only if the short-window evidence remains favorable.
+
+This follows the same spirit as robust loop closure: hypothesis generation, local verification, then cautious integration. Current experiments show that shadow recovery can repair some failure windows, but the verification signal is still not strong enough to make it the default path across every tested TUM window.
+
+## Current Extension: Pose-Anchor Verification
+
+Another follow-up direction is to keep the current-frame geometric verification, but add an explicit anchor-pose check against the archived hypothesis:
+
+1. Archive a lightweight camera-pose summary together with the recovered state.
+2. For ambiguous or stale recover candidates, compare the current predicted pose against that archived anchor.
+3. Accept only when the candidate improves both current-frame geometry and anchor-pose consistency.
+
+This is intended to be stricter than descriptor-only recovery, but less invasive than shadow recovery.

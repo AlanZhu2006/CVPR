@@ -166,6 +166,7 @@ def evaluate_relpose(
         del memory_stats
         gc.collect()
         if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
     results = process_directory(str(output_root))
@@ -191,6 +192,16 @@ def evaluate_relpose(
     geometry_verification_rejects = sum(
         int(item["memory"].get("geometry_verification_rejects", 0)) for item in per_sequence
     )
+    anchor_pose_verification_accepts = sum(
+        int(item["memory"].get("anchor_pose_verification_accepts", 0)) for item in per_sequence
+    )
+    anchor_pose_verification_rejects = sum(
+        int(item["memory"].get("anchor_pose_verification_rejects", 0)) for item in per_sequence
+    )
+    shadow_recovery_starts = sum(int(item["memory"].get("shadow_recovery_starts", 0)) for item in per_sequence)
+    shadow_recovery_commits = sum(int(item["memory"].get("shadow_recovery_commits", 0)) for item in per_sequence)
+    shadow_recovery_rejects = sum(int(item["memory"].get("shadow_recovery_rejects", 0)) for item in per_sequence)
+    shadow_recovery_frames = sum(int(item["memory"].get("shadow_recovery_frames", 0)) for item in per_sequence)
     archive_count = sum(int(item["memory"]["archive_count"]) for item in per_sequence)
     best_similarity_weighted_sum = sum(
         float(item["memory"].get("avg_best_similarity", 0.0)) * int(item["memory"]["retrieval_attempts"])
@@ -230,6 +241,24 @@ def evaluate_relpose(
         * int(item["memory"].get("geometry_verification_rollouts", 0))
         for item in per_sequence
     )
+    shadow_geo_gain_weighted_sum = sum(
+        float(item["memory"].get("avg_shadow_recovery_geo_gain", 0.0))
+        * int(item["memory"].get("shadow_recovery_commits", 0))
+        for item in per_sequence
+    )
+    shadow_conf_delta_weighted_sum = sum(
+        float(item["memory"].get("avg_shadow_recovery_conf_delta", 0.0))
+        * int(item["memory"].get("shadow_recovery_commits", 0))
+        for item in per_sequence
+    )
+    anchor_pose_gain_weighted_sum = sum(
+        float(item["memory"].get("avg_anchor_pose_score_gain", 0.0))
+        * (
+            int(item["memory"].get("anchor_pose_verification_accepts", 0))
+            + int(item["memory"].get("anchor_pose_verification_rejects", 0))
+        )
+        for item in per_sequence
+    )
     avg_fps = sum(float(item["fps"]) for item in per_sequence) / max(len(per_sequence), 1)
 
     summary = {
@@ -252,6 +281,12 @@ def evaluate_relpose(
         "geometry_verification_rollouts": geometry_verification_rollouts,
         "geometry_verification_accepts": geometry_verification_accepts,
         "geometry_verification_rejects": geometry_verification_rejects,
+        "anchor_pose_verification_accepts": anchor_pose_verification_accepts,
+        "anchor_pose_verification_rejects": anchor_pose_verification_rejects,
+        "shadow_recovery_starts": shadow_recovery_starts,
+        "shadow_recovery_commits": shadow_recovery_commits,
+        "shadow_recovery_rejects": shadow_recovery_rejects,
+        "shadow_recovery_frames": shadow_recovery_frames,
         "recovery_success_rate": retrieval_successes / retrieval_attempts if retrieval_attempts else 0.0,
         "avg_best_similarity": best_similarity_weighted_sum / retrieval_attempts if retrieval_attempts else 0.0,
         "avg_best_gap": best_gap_weighted_sum / retrieval_attempts if retrieval_attempts else 0.0,
@@ -275,6 +310,21 @@ def evaluate_relpose(
             if geometry_verification_rollouts
             else 0.0
         ),
+        "avg_anchor_pose_score_gain": (
+            anchor_pose_gain_weighted_sum
+            / (anchor_pose_verification_accepts + anchor_pose_verification_rejects)
+            if (anchor_pose_verification_accepts + anchor_pose_verification_rejects)
+            else 0.0
+        ),
+        "avg_shadow_recovery_geo_gain": (
+            shadow_geo_gain_weighted_sum / shadow_recovery_commits if shadow_recovery_commits else 0.0
+        ),
+        "avg_shadow_recovery_conf_delta": (
+            shadow_conf_delta_weighted_sum / shadow_recovery_commits if shadow_recovery_commits else 0.0
+        ),
+        "avg_shadow_recovery_frames": (
+            shadow_recovery_frames / shadow_recovery_starts if shadow_recovery_starts else 0.0
+        ),
         "sequences": per_sequence,
         "memory_config": memory_config.for_mode(mode).to_dict(),
         "seed": seed,
@@ -285,5 +335,6 @@ def evaluate_relpose(
     del model
     gc.collect()
     if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
     return summary

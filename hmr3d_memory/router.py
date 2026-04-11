@@ -36,6 +36,7 @@ class ArchiveEntry:
     init_state_feat: torch.Tensor
     mem: torch.Tensor
     init_mem: torch.Tensor
+    camera_pose: torch.Tensor | None
 
 
 @dataclass
@@ -49,6 +50,7 @@ class RecoveryProposal:
     query_state_gap: float
     recovery_alpha: float
     is_latest_archive: bool
+    archive_camera_pose: torch.Tensor | None
     state_args: StateTuple
 
 
@@ -84,6 +86,15 @@ class MemoryRouter:
             "geometry_verification_rejects": 0,
             "geometry_verification_geo_gain_sum": 0.0,
             "geometry_verification_conf_delta_sum": 0.0,
+            "anchor_pose_verification_accepts": 0,
+            "anchor_pose_verification_rejects": 0,
+            "anchor_pose_score_gain_sum": 0.0,
+            "shadow_recovery_starts": 0,
+            "shadow_recovery_commits": 0,
+            "shadow_recovery_rejects": 0,
+            "shadow_recovery_frames": 0,
+            "shadow_recovery_geo_gain_sum": 0.0,
+            "shadow_recovery_conf_delta_sum": 0.0,
         }
 
     @staticmethod
@@ -275,6 +286,7 @@ class MemoryRouter:
                     query_state_gap=gap,
                     recovery_alpha=alpha,
                     is_latest_archive=is_latest_archive,
+                    archive_camera_pose=entry.camera_pose.clone() if entry.camera_pose is not None else None,
                     state_args=(recovered_state, state_pos, init_state_feat, recovered_mem, init_mem),
                 )
             )
@@ -310,6 +322,19 @@ class MemoryRouter:
         else:
             self.stats["geometry_verification_rejects"] += 1
 
+    def record_anchor_pose_verification(
+        self,
+        *,
+        baseline_anchor_score: float,
+        candidate_anchor_score: float,
+        accepted: bool,
+    ) -> None:
+        self.stats["anchor_pose_score_gain_sum"] += baseline_anchor_score - candidate_anchor_score
+        if accepted:
+            self.stats["anchor_pose_verification_accepts"] += 1
+        else:
+            self.stats["anchor_pose_verification_rejects"] += 1
+
     def accept_recovery(
         self,
         frame_idx: int,
@@ -319,6 +344,8 @@ class MemoryRouter:
         baseline_conf: float,
         candidate_geo_rmse: float,
         candidate_conf: float,
+        baseline_anchor_score: float | None = None,
+        candidate_anchor_score: float | None = None,
     ) -> None:
         self.last_recovery_frame = frame_idx
         self.stats["retrieval_successes"] += 1
@@ -332,6 +359,12 @@ class MemoryRouter:
             candidate_conf=candidate_conf,
             accepted=True,
         )
+        if baseline_anchor_score is not None and candidate_anchor_score is not None:
+            self.record_anchor_pose_verification(
+                baseline_anchor_score=baseline_anchor_score,
+                candidate_anchor_score=candidate_anchor_score,
+                accepted=True,
+            )
         self.events.append(
             {
                 "frame_idx": frame_idx,
@@ -348,6 +381,8 @@ class MemoryRouter:
                 "candidate_geo_rmse": candidate_geo_rmse,
                 "baseline_conf": baseline_conf,
                 "candidate_conf": candidate_conf,
+                "baseline_anchor_score": baseline_anchor_score,
+                "candidate_anchor_score": candidate_anchor_score,
                 "recovered": True,
                 "reason": "recovered_after_geometry_verification",
             }
@@ -389,6 +424,8 @@ class MemoryRouter:
         baseline_conf: float,
         candidate_geo_rmse: float | None = None,
         candidate_conf: float | None = None,
+        baseline_anchor_score: float | None = None,
+        candidate_anchor_score: float | None = None,
         reason: str = "rejected_by_geometry_verification",
     ) -> None:
         if proposal is not None and candidate_geo_rmse is not None and candidate_conf is not None:
@@ -399,10 +436,17 @@ class MemoryRouter:
                 candidate_conf=candidate_conf,
                 accepted=False,
             )
+        if baseline_anchor_score is not None and candidate_anchor_score is not None:
+            self.record_anchor_pose_verification(
+                baseline_anchor_score=baseline_anchor_score,
+                candidate_anchor_score=candidate_anchor_score,
+                accepted=False,
+            )
         event = {
             "frame_idx": frame_idx,
             "baseline_geo_rmse": baseline_geo_rmse,
             "baseline_conf": baseline_conf,
+            "baseline_anchor_score": baseline_anchor_score,
             "recovered": False,
             "reason": reason,
         }
@@ -424,9 +468,172 @@ class MemoryRouter:
             event["candidate_geo_rmse"] = candidate_geo_rmse
         if candidate_conf is not None:
             event["candidate_conf"] = candidate_conf
+        if candidate_anchor_score is not None:
+            event["candidate_anchor_score"] = candidate_anchor_score
         self.events.append(event)
 
-    def archive(self, frame_idx: int, state_args: StateTuple) -> None:
+    def start_shadow_recovery(
+        self,
+        frame_idx: int,
+        proposal: RecoveryProposal,
+        *,
+        baseline_geo_rmse: float,
+        baseline_conf: float,
+        candidate_geo_rmse: float,
+        candidate_conf: float,
+        shadow_window: int,
+    ) -> None:
+        self.stats["shadow_recovery_starts"] += 1
+        self.events.append(
+            {
+                "frame_idx": frame_idx,
+                "archive_id": proposal.archive_id,
+                "archive_frame_idx": proposal.archive_frame_idx,
+                "candidate_rank": proposal.candidate_rank,
+                "query_similarity": proposal.query_similarity,
+                "state_similarity": proposal.state_similarity,
+                "sequence_similarity": proposal.sequence_similarity,
+                "query_state_gap": proposal.query_state_gap,
+                "recovery_alpha": proposal.recovery_alpha,
+                "is_latest_archive": proposal.is_latest_archive,
+                "baseline_geo_rmse": baseline_geo_rmse,
+                "candidate_geo_rmse": candidate_geo_rmse,
+                "baseline_conf": baseline_conf,
+                "candidate_conf": candidate_conf,
+                "shadow_window": shadow_window,
+                "recovered": False,
+                "reason": "shadow_recovery_started",
+            }
+        )
+
+    def update_shadow_recovery(
+        self,
+        *,
+        frame_idx: int,
+        proposal: RecoveryProposal,
+        comparison_frames: int,
+        baseline_geo_rmse: float,
+        baseline_conf: float,
+        candidate_geo_rmse: float,
+        candidate_conf: float,
+        cumulative_geo_gain: float,
+        cumulative_conf_delta: float,
+    ) -> None:
+        self.stats["shadow_recovery_frames"] += 1
+        self.events.append(
+            {
+                "frame_idx": frame_idx,
+                "archive_id": proposal.archive_id,
+                "archive_frame_idx": proposal.archive_frame_idx,
+                "candidate_rank": proposal.candidate_rank,
+                "query_similarity": proposal.query_similarity,
+                "state_similarity": proposal.state_similarity,
+                "sequence_similarity": proposal.sequence_similarity,
+                "query_state_gap": proposal.query_state_gap,
+                "recovery_alpha": proposal.recovery_alpha,
+                "is_latest_archive": proposal.is_latest_archive,
+                "baseline_geo_rmse": baseline_geo_rmse,
+                "candidate_geo_rmse": candidate_geo_rmse,
+                "baseline_conf": baseline_conf,
+                "candidate_conf": candidate_conf,
+                "comparison_frames": comparison_frames,
+                "cumulative_geo_gain": cumulative_geo_gain,
+                "cumulative_conf_delta": cumulative_conf_delta,
+                "recovered": False,
+                "reason": "shadow_recovery_progress",
+            }
+        )
+
+    def commit_shadow_recovery(
+        self,
+        frame_idx: int,
+        proposal: RecoveryProposal,
+        *,
+        comparison_frames: int,
+        cumulative_geo_gain: float,
+        cumulative_conf_delta: float,
+        baseline_geo_rmse: float,
+        baseline_conf: float,
+        candidate_geo_rmse: float,
+        candidate_conf: float,
+    ) -> None:
+        self.last_recovery_frame = frame_idx
+        self.stats["retrieval_successes"] += 1
+        self.stats["verified_similarity_sum"] += proposal.state_similarity
+        self.stats["verified_gap_sum"] += proposal.query_state_gap
+        self.stats["verified_sequence_similarity_sum"] += proposal.sequence_similarity
+        self.stats["shadow_recovery_commits"] += 1
+        self.stats["shadow_recovery_geo_gain_sum"] += cumulative_geo_gain
+        self.stats["shadow_recovery_conf_delta_sum"] += cumulative_conf_delta
+        self.events.append(
+            {
+                "frame_idx": frame_idx,
+                "archive_id": proposal.archive_id,
+                "archive_frame_idx": proposal.archive_frame_idx,
+                "candidate_rank": proposal.candidate_rank,
+                "query_similarity": proposal.query_similarity,
+                "state_similarity": proposal.state_similarity,
+                "sequence_similarity": proposal.sequence_similarity,
+                "query_state_gap": proposal.query_state_gap,
+                "recovery_alpha": proposal.recovery_alpha,
+                "is_latest_archive": proposal.is_latest_archive,
+                "baseline_geo_rmse": baseline_geo_rmse,
+                "candidate_geo_rmse": candidate_geo_rmse,
+                "baseline_conf": baseline_conf,
+                "candidate_conf": candidate_conf,
+                "comparison_frames": comparison_frames,
+                "cumulative_geo_gain": cumulative_geo_gain,
+                "cumulative_conf_delta": cumulative_conf_delta,
+                "recovered": True,
+                "reason": "shadow_recovery_committed",
+            }
+        )
+
+    def reject_shadow_recovery(
+        self,
+        frame_idx: int,
+        proposal: RecoveryProposal,
+        *,
+        comparison_frames: int,
+        cumulative_geo_gain: float,
+        cumulative_conf_delta: float,
+        baseline_geo_rmse: float,
+        baseline_conf: float,
+        candidate_geo_rmse: float,
+        candidate_conf: float,
+        reason: str = "shadow_recovery_rejected",
+    ) -> None:
+        self.stats["shadow_recovery_rejects"] += 1
+        self.events.append(
+            {
+                "frame_idx": frame_idx,
+                "archive_id": proposal.archive_id,
+                "archive_frame_idx": proposal.archive_frame_idx,
+                "candidate_rank": proposal.candidate_rank,
+                "query_similarity": proposal.query_similarity,
+                "state_similarity": proposal.state_similarity,
+                "sequence_similarity": proposal.sequence_similarity,
+                "query_state_gap": proposal.query_state_gap,
+                "recovery_alpha": proposal.recovery_alpha,
+                "is_latest_archive": proposal.is_latest_archive,
+                "baseline_geo_rmse": baseline_geo_rmse,
+                "candidate_geo_rmse": candidate_geo_rmse,
+                "baseline_conf": baseline_conf,
+                "candidate_conf": candidate_conf,
+                "comparison_frames": comparison_frames,
+                "cumulative_geo_gain": cumulative_geo_gain,
+                "cumulative_conf_delta": cumulative_conf_delta,
+                "recovered": False,
+                "reason": reason,
+            }
+        )
+
+    def archive(
+        self,
+        frame_idx: int,
+        state_args: StateTuple,
+        camera_pose: torch.Tensor | None = None,
+    ) -> None:
         state_feat, state_pos, init_state_feat, mem, init_mem = state_args
         entry = ArchiveEntry(
             archive_id=self.next_archive_id,
@@ -441,6 +648,7 @@ class MemoryRouter:
             init_state_feat=init_state_feat.detach().cpu(),
             mem=mem.detach().cpu(),
             init_mem=init_mem.detach().cpu(),
+            camera_pose=camera_pose.detach().cpu() if camera_pose is not None else None,
         )
         self.next_archive_id += 1
         self.archive_bank.append(entry)
@@ -492,6 +700,25 @@ class MemoryRouter:
         summary["avg_geometry_verification_conf_delta"] = (
             float(self.stats["geometry_verification_conf_delta_sum"]) / verification_rollouts
             if verification_rollouts
+            else 0.0
+        )
+        anchor_checks = int(self.stats["anchor_pose_verification_accepts"]) + int(
+            self.stats["anchor_pose_verification_rejects"]
+        )
+        summary["avg_anchor_pose_score_gain"] = (
+            float(self.stats["anchor_pose_score_gain_sum"]) / anchor_checks if anchor_checks else 0.0
+        )
+        shadow_commits = int(self.stats["shadow_recovery_commits"])
+        shadow_frames = int(self.stats["shadow_recovery_frames"])
+        summary["avg_shadow_recovery_geo_gain"] = (
+            float(self.stats["shadow_recovery_geo_gain_sum"]) / shadow_commits if shadow_commits else 0.0
+        )
+        summary["avg_shadow_recovery_conf_delta"] = (
+            float(self.stats["shadow_recovery_conf_delta_sum"]) / shadow_commits if shadow_commits else 0.0
+        )
+        summary["avg_shadow_recovery_frames"] = (
+            float(shadow_frames) / int(self.stats["shadow_recovery_starts"])
+            if int(self.stats["shadow_recovery_starts"])
             else 0.0
         )
         return summary
