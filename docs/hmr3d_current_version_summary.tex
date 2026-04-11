@@ -1,0 +1,307 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\title{HMR3D Current Version Summary\\Implementation and Experimental Results}
+\author{Repository snapshot: commit \texttt{46f5e73}}
+\date{April 11, 2026}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+This document summarizes the currently committed HMR3D implementation in
+\texttt{/home/pengyue/Codespace/HMR3D}. It intentionally covers only the
+committed \texttt{pose-anchor} version and excludes later local
+\texttt{Gaussian/submap} experiments that were not kept in the clean working
+tree.
+
+The current system extends the upstream \texttt{TTT3R} runtime with an explicit
+state-level memory lifecycle:
+\begin{itemize}
+\item archive recurrent state snapshots into an external bank,
+\item retrieve candidate memories by descriptor similarity,
+\item verify candidates with a counterfactual geometric rollout, and
+\item further filter ambiguous or stale recoveries with anchor-pose scoring.
+\end{itemize}
+
+The best validated configuration is the experiment manifest
+\texttt{configs/tum\_relpose\_sweep\_224\_v11\_pose\_anchor\_full7.json}, evaluated
+against the \texttt{TTT3R} baseline on seven TUM long-sequence windows under
+deterministic inference.
+
+\section{Implementation Summary}
+\subsection{Code Organization}
+The current implementation is split across the following local modules:
+\begin{itemize}
+\item \texttt{hmr3d\_memory/config.py}: memory hyper-parameters and mode-specific
+configuration.
+\item \texttt{hmr3d\_memory/router.py}: archive bank, retrieval logic, recovery
+proposal construction, geometric verification statistics, and anchor-pose
+verification statistics.
+\item \texttt{hmr3d\_memory/adapter.py}: runtime wrapper around the upstream
+\texttt{TTT3R} rollout, including the counterfactual verification path.
+\item \texttt{hmr3d\_memory/eval\_relpose.py}: deterministic rel-pose
+evaluation, per-sequence metric aggregation, and memory event dumps.
+\item \texttt{scripts/run\_relpose\_memory\_sweep.py}: experiment sweep entrypoint.
+\item \texttt{scripts/run\_longseq\_eval.py}: full long-sequence evaluation
+entrypoint.
+\end{itemize}
+
+\subsection{Memory Lifecycle}
+At the current commit, the memory system is state-level and does not modify the
+upstream submodule parameters.
+
+\paragraph{Archive.}
+Every active segment maintains frame descriptors and the current recurrent state.
+When the archive interval is reached, the system stores:
+\begin{itemize}
+\item a segment descriptor,
+\item a short tail descriptor history,
+\item a combined state descriptor from \texttt{state\_feat} and \texttt{mem},
+\item the recurrent tensors needed to reconstruct the state, and
+\item an optional camera pose anchor.
+\end{itemize}
+This is implemented in \texttt{MemoryRouter} via \texttt{ArchiveEntry}.
+
+\paragraph{Retrieve.}
+At each eligible frame, the router ranks archived segments with descriptor
+similarity. It then applies thresholding on:
+\begin{itemize}
+\item query-to-archive descriptor similarity,
+\item current-state similarity,
+\item the query-state gap, and
+\item a recovery cooldown and an attempt cooldown.
+\end{itemize}
+
+\paragraph{Geometric verification.}
+For shortlisted candidates, the adapter runs a counterfactual rollout: it
+injects the archived state proposal, executes the current frame, and compares
+the resulting geometric quality against the baseline rollout. The candidate is
+accepted only if it satisfies the configured geometric and confidence tests.
+
+\paragraph{Anchor-pose verification.}
+The current best version adds a second verifier for ambiguous or stale
+candidates. It compares the current pose estimate and the archived camera anchor
+through an anchor-pose quality score. The recovery is retained only if the
+candidate score is at least as good as the baseline score under the configured
+ratio and gain thresholds.
+
+\subsection{Current Default Hyper-parameters}
+The best validated manifest uses the following memory settings:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+\texttt{archive\_interval} & 120 \\
+\texttt{retrieval\_topk} & 2 \\
+\texttt{retrieval\_similarity\_thresh} & 0.92 \\
+\texttt{verification\_similarity\_thresh} & 0.80 \\
+\texttt{max\_state\_similarity\_for\_recover} & 0.995 \\
+\texttt{query\_state\_gap\_thresh} & -0.05 \\
+\texttt{recovery\_alpha} & 0.35 \\
+\texttt{verification\_geo\_ratio\_thresh} & 1.0 \\
+\texttt{verification\_conf\_tolerance} & 0.1 \\
+\texttt{min\_frames\_before\_retrieve} & 30 \\
+\texttt{retrieval\_cooldown} & 30 \\
+\texttt{retrieval\_attempt\_cooldown} & 30 \\
+\texttt{reset\_on\_archive} & false \\
+\texttt{enable\_anchor\_pose\_verification} & true \\
+\texttt{anchor\_pose\_only\_for\_ambiguous} & true \\
+\texttt{anchor\_pose\_rotation\_weight} & 0.25 \\
+\texttt{anchor\_pose\_score\_ratio\_thresh} & 1.0 \\
+\texttt{anchor\_pose\_min\_score\_gain} & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Evaluation Protocol}
+\subsection{Dataset and Hardware}
+The current report uses the deterministic rel-pose sweep at:
+\begin{itemize}
+\item dataset: \texttt{tum\_s1\_1000},
+\item input size: \texttt{224},
+\item device: \texttt{cuda},
+\item seed: \texttt{0},
+\item deterministic: \texttt{true}.
+\end{itemize}
+
+The seven evaluated sequence windows are:
+\begin{itemize}
+\item \texttt{sitting\_static},
+\item \texttt{static\_head500},
+\item \texttt{static\_tail500},
+\item \texttt{sitting\_xyz},
+\item \texttt{xyz\_head500},
+\item \texttt{xyz\_mid500},
+\item \texttt{xyz\_tail500}.
+\end{itemize}
+
+The evaluation files are stored under
+\texttt{reports/generated/tum\_relpose\_sweep\_224\_v11\_pose\_anchor\_full7}.
+
+\subsection{Compared Methods}
+Three configurations were compared:
+\begin{itemize}
+\item \textbf{TTT3R baseline}: upstream behavior without external archive/retrieve/recover.
+\item \textbf{HMR geometry-only}: descriptor retrieval plus geometric verification.
+\item \textbf{HMR pose-anchor}: geometry-only plus anchor-pose verification on
+ambiguous or stale candidates.
+\end{itemize}
+
+\section{Main Results}
+\subsection{Aggregate Results}
+Table~\ref{tab:aggregate} reports the main aggregate metrics.
+
+\begin{table}[h]
+\centering
+\caption{Aggregate results on the seven-window TUM rel-pose benchmark. Lower is
+better for ATE, RPE\_trans, and RPE\_rot. Higher is better for FPS.}
+\label{tab:aggregate}
+\begin{tabular}{lrrrr}
+\toprule
+Method & Avg. ATE & Avg. RPE$_{\text{trans}}$ & Avg. RPE$_{\text{rot}}$ & Avg. FPS \\
+\midrule
+TTT3R baseline & 0.088360 & 0.025146 & 0.938209 & 3.779 \\
+HMR geometry-only & 0.081347 & 0.025555 & 0.938447 & 3.716 \\
+HMR pose-anchor & \textbf{0.079694} & 0.025560 & \textbf{0.934255} & 3.668 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Relative to the baseline, the current \textbf{HMR pose-anchor} version:
+\begin{itemize}
+\item reduces average ATE from 0.088360 to 0.079694,
+\item yields a relative ATE improvement of approximately 9.8\%,
+\item slightly improves average rotational error, and
+\item incurs an average throughput drop of about 2.9\%.
+\end{itemize}
+
+Relative to the geometry-only version, pose-anchor further improves ATE by
+approximately 2.0\%.
+
+\subsection{Per-sequence Results}
+Table~\ref{tab:perseq} shows the per-window ATE comparison between the baseline
+and the current best HMR version.
+
+\begin{table}[p]
+\centering
+\caption{Per-sequence ATE comparison. Positive ``Rel. gain'' means the HMR
+version improves over the baseline.}
+\label{tab:perseq}
+\begin{tabular}{lrrrr}
+\toprule
+Sequence & Baseline ATE & HMR ATE & $\Delta$ATE & Rel. gain (\%) \\
+\midrule
+\texttt{sitting\_static} & 0.028312 & 0.021613 & -0.006700 & 23.66 \\
+\texttt{static\_head500} & 0.023047 & 0.021860 & -0.001187 & 5.15 \\
+\texttt{static\_tail500} & 0.014938 & 0.013395 & -0.001544 & 10.33 \\
+\texttt{sitting\_xyz} & 0.278476 & 0.269411 & -0.009065 & 3.26 \\
+\texttt{xyz\_head500} & 0.064023 & 0.054727 & -0.009297 & 14.52 \\
+\texttt{xyz\_mid500} & 0.067648 & 0.070329 & 0.002681 & -3.96 \\
+\texttt{xyz\_tail500} & 0.142074 & 0.106521 & -0.035553 & 25.02 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The key pattern is stable:
+\begin{itemize}
+\item 6 of 7 windows improve in ATE,
+\item the largest gain appears on \texttt{xyz\_tail500},
+\item the only regression is \texttt{xyz\_mid500}, and
+\item the method is improving global trajectory quality more clearly than local
+translational error.
+\end{itemize}
+
+\subsection{Memory Activity}
+The best HMR trial generated the following aggregate memory statistics:
+\begin{itemize}
+\item 33 archives,
+\item 108 retrieval attempts,
+\item 32 successful recoveries after verification,
+\item 124 geometric verification rollouts,
+\item 32 anchor-pose verification accepts,
+\item 92 anchor-pose verification rejects,
+\item average recovery success rate of 29.6\%.
+\end{itemize}
+
+These numbers show that the gain does not come from blindly restoring history.
+The majority of retrieval candidates are rejected by the verification layers,
+and only a filtered subset is merged back into the active state.
+
+\section{Interpretation}
+The current version supports the following conclusions.
+
+\paragraph{What works.}
+The archive/retrieve/recover lifecycle can improve long-sequence robustness
+without retraining the base model. The main benefit is on \textbf{global ATE},
+which is consistent with the goal of mitigating drift and exploiting long-range
+revisits.
+
+\paragraph{What does not improve yet.}
+Average translational RPE does not improve. This means the method is not yet a
+uniform improvement across all metrics. It is currently stronger as a
+\textbf{global drift correction mechanism} than as a local-frame refinement
+mechanism.
+
+\paragraph{Why pose-anchor helps.}
+The geometry-only variant already removes many bad recoveries, but ambiguous
+revisits still remain. Adding anchor-pose verification narrows those cases and
+reduces average ATE from 0.081347 to 0.079694 on the same full-seven benchmark.
+
+\section{Reproducibility}
+The exact experiment manifest for the current best result is:
+\begin{quote}
+\texttt{configs/tum\_relpose\_sweep\_224\_v11\_pose\_anchor\_full7.json}
+\end{quote}
+
+The sweep can be reproduced with:
+\begin{quote}
+\texttt{python3 scripts/run\_relpose\_memory\_sweep.py --config}\\
+\texttt{configs/tum\_relpose\_sweep\_224\_v11\_pose\_anchor\_full7.json}
+\end{quote}
+
+The key output files are:
+\begin{itemize}
+\item \texttt{reports/generated/tum\_relpose\_sweep\_224\_v11\_pose\_anchor\_full7/leaderboard.json}
+\item \texttt{reports/generated/tum\_relpose\_sweep\_224\_v11\_pose\_anchor\_full7/ttt3r\_baseline/summary.json}
+\item \texttt{reports/generated/tum\_relpose\_sweep\_224\_v11\_pose\_anchor\_full7/hmr\_full\_geometry\_pose\_anchor/summary.json}
+\end{itemize}
+
+\section{Current Limitations}
+This committed version still has clear boundaries:
+\begin{itemize}
+\item it is a state-level memory system, not yet a map-level submap system,
+\item it improves ATE more consistently than RPE$_{\text{trans}}$,
+\item one of the seven windows still regresses, and
+\item the evaluation was run at input size 224 because the local RTX 2060 6GB
+machine could not reliably run the same long-sequence setup at 512.
+\end{itemize}
+
+\section{Bottom Line}
+For the current clean repository state, the correct short summary is:
+
+\begin{quote}
+The committed HMR3D implementation adds an external state-memory lifecycle to
+TTT3R and achieves a \textbf{9.8\% average ATE improvement} over the TTT3R
+baseline on a deterministic seven-window TUM long-sequence benchmark, with a
+small throughput cost and no corresponding gain in translational RPE.
+\end{quote}
+
+\end{document}
