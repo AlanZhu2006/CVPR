@@ -1,0 +1,7 @@
+# Minimal deps to run: cd CVPR && pip install -r requirements-test.txt && python3 -m pytest tests/ -q
+einops>=0.6.0
+pytest>=7.0.0
+torch>=2.0.0
+# For scripts/run_relpose_memory_sweep.py and scripts/run_validation_suite.sh (ATE/RPE via evo)
+evo>=1.11.0
+opencv-python-headless>=4.5.0

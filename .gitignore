@@ -6,7 +6,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.venv-nuc/
 venv/
+nuc_output/
 env/
 *.egg-info/
 

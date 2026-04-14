@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from hmr3d_memory.adapter import _should_accept_anchor_pose_candidate
+from hmr3d_memory.anchor_gate import should_accept_anchor_pose_candidate as _should_accept_anchor_pose_candidate
 from hmr3d_memory.config import MemoryConfig
 from hmr3d_memory.router import RecoveryProposal
 from hmr3d_memory.ttt3r_io import compute_anchor_pose_score_from_matrices

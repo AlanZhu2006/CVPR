@@ -6,7 +6,10 @@ from typing import Dict, List, Tuple
 import torch
 import torch.nn.functional as F
 
+from .bank.hierarchical_bank import HierarchicalMemoryBank
 from .config import MemoryConfig
+from .policies.retrieve_policy import RetrievePolicy
+from .policies.write_policy import WritePolicy
 
 
 StateTuple = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -95,7 +98,22 @@ class MemoryRouter:
             "shadow_recovery_frames": 0,
             "shadow_recovery_geo_gain_sum": 0.0,
             "shadow_recovery_conf_delta_sum": 0.0,
+            "write_gate_accepts": 0,
+            "write_gate_rejects": 0,
+            "write_gate_delays": 0,
+            "coarse_miss_fallback_full_scan": 0,
+            "recover_gate_blocks": 0,
+            "recover_gate_alpha_reduced": 0,
+            "merge_events": 0,
+            "local_adapt_applied": 0,
         }
+        self._write_policy = WritePolicy(config)
+        self._retrieve_policy = RetrievePolicy(config)
+        self._hierarchical_bank: HierarchicalMemoryBank | None = (
+            HierarchicalMemoryBank(config.hierarchy_max_scenes) if config.enable_v2_hierarchy else None
+        )
+        self._last_archived_segment_desc: torch.Tensor | None = None
+        self._archive_defer_until = -1
 
     @staticmethod
     def describe_global_feat(global_img_feat: torch.Tensor) -> torch.Tensor:
@@ -122,6 +140,61 @@ class MemoryRouter:
             return False
         active_length = frame_idx - self.segment_start + 1
         return active_length >= self.config.archive_interval
+
+    def can_archive(
+        self,
+        frame_idx: int,
+        state_args: StateTuple,
+        optional_state_conf: float | None = None,
+    ) -> bool:
+        if not self.should_archive(frame_idx):
+            return False
+        if self._archive_defer_until >= 0 and frame_idx < self._archive_defer_until:
+            return False
+        if not self.config.enable_v2_write_gate:
+            return True
+        wd = self._write_policy.decide(
+            frame_idx=frame_idx,
+            segment_descriptors=self.segment_descriptors,
+            last_archived_segment_desc=self._last_archived_segment_desc,
+            optional_state_conf=optional_state_conf,
+        )
+        if wd.delay_frames > 0:
+            self._archive_defer_until = frame_idx + wd.delay_frames
+            self.stats["write_gate_delays"] += 1
+            return False
+        if not wd.accept:
+            self.stats["write_gate_rejects"] += 1
+            return False
+        self._archive_defer_until = -1
+        self.stats["write_gate_accepts"] += 1
+        return True
+
+    def rebuild_proposal_with_alpha(
+        self,
+        proposal: RecoveryProposal,
+        current_state_feat: torch.Tensor,
+        current_mem: torch.Tensor,
+        new_alpha: float,
+    ) -> RecoveryProposal:
+        entry = next(e for e in self.archive_bank if e.archive_id == proposal.archive_id)
+        sf = new_alpha * entry.state_feat.to(current_state_feat.device) + (1.0 - new_alpha) * current_state_feat
+        m = new_alpha * entry.mem.to(current_mem.device) + (1.0 - new_alpha) * current_mem
+        _, state_pos, init_state_feat, _, init_mem = proposal.state_args
+        new_state: StateTuple = (sf, state_pos, init_state_feat, m, init_mem)
+        return RecoveryProposal(
+            archive_id=proposal.archive_id,
+            archive_frame_idx=proposal.archive_frame_idx,
+            candidate_rank=proposal.candidate_rank,
+            query_similarity=proposal.query_similarity,
+            state_similarity=proposal.state_similarity,
+            sequence_similarity=proposal.sequence_similarity,
+            query_state_gap=proposal.query_state_gap,
+            recovery_alpha=new_alpha,
+            is_latest_archive=proposal.is_latest_archive,
+            archive_camera_pose=proposal.archive_camera_pose,
+            state_args=new_state,
+        )
 
     def _segment_descriptor(self) -> torch.Tensor:
         if not self.segment_descriptors:
@@ -161,12 +234,50 @@ class MemoryRouter:
         if frame_idx - self.last_attempt_frame < self.config.retrieval_attempt_cooldown:
             return []
 
+        entries_to_scan, _ = self._retrieve_policy.filter_entries(
+            query_descriptor, self.archive_bank, self._hierarchical_bank
+        )
+        coarse_subset = (
+            self.config.enable_v2_hierarchy
+            and self._hierarchical_bank is not None
+            and len(entries_to_scan) < len(self.archive_bank)
+        )
+        selected, attempted = self._proposals_for_entries(
+            frame_idx,
+            state_args,
+            query_descriptor,
+            entries_to_scan,
+            log_attempt=True,
+            silent=False,
+        )
+        if not selected and coarse_subset:
+            self.stats["coarse_miss_fallback_full_scan"] += 1
+            selected, _ = self._proposals_for_entries(
+                frame_idx,
+                state_args,
+                query_descriptor,
+                self.archive_bank,
+                log_attempt=not attempted,
+                silent=True,
+            )
+        return selected
+
+    def _proposals_for_entries(
+        self,
+        frame_idx: int,
+        state_args: StateTuple,
+        query_descriptor: torch.Tensor,
+        entries: List[ArchiveEntry],
+        *,
+        log_attempt: bool,
+        silent: bool,
+    ) -> Tuple[List[RecoveryProposal], bool]:
         state_feat, state_pos, init_state_feat, mem, init_mem = state_args
         current_state_desc = self.describe_state(state_feat, mem)
 
         candidates = []
         latest_archive_id = self.archive_bank[-1].archive_id if self.archive_bank else -1
-        for entry in self.archive_bank:
+        for entry in entries:
             if frame_idx - entry.frame_idx < self.config.min_frames_before_retrieve:
                 continue
             query_sim = F.cosine_similarity(query_descriptor, entry.descriptor).mean().item()
@@ -175,17 +286,22 @@ class MemoryRouter:
             candidates.append((query_sim, state_sim, sequence_sim, entry))
 
         if not candidates:
-            return []
+            return [], False
 
-        self.stats["retrieval_attempts"] += 1
-        self.last_attempt_frame = frame_idx
+        attempted = False
+        if log_attempt:
+            self.stats["retrieval_attempts"] += 1
+            self.last_attempt_frame = frame_idx
+            attempted = True
+
         candidates.sort(key=lambda item: (item[2], item[0]), reverse=True)
         top_candidates = candidates[: max(self.config.retrieval_topk, 1)]
         top_query_sim, top_state_sim, top_sequence_sim, best_entry = top_candidates[0]
         top_gap = top_query_sim - top_state_sim
-        self.stats["best_similarity_sum"] += top_query_sim
-        self.stats["best_gap_sum"] += top_gap
-        self.stats["best_sequence_similarity_sum"] += top_sequence_sim
+        if not silent:
+            self.stats["best_similarity_sum"] += top_query_sim
+            self.stats["best_gap_sum"] += top_gap
+            self.stats["best_sequence_similarity_sum"] += top_sequence_sim
 
         event = {
             "frame_idx": frame_idx,
@@ -202,7 +318,8 @@ class MemoryRouter:
         for rank, (query_sim, state_sim, sequence_sim, entry) in enumerate(top_candidates, start=1):
             gap = query_sim - state_sim
             if query_sim < self.config.retrieval_similarity_thresh:
-                self.stats["retrieval_threshold_rejects"] += 1
+                if not silent:
+                    self.stats["retrieval_threshold_rejects"] += 1
                 event.update(
                     {
                         "archive_id": entry.archive_id,
@@ -216,7 +333,8 @@ class MemoryRouter:
                 )
                 break
             if state_sim < self.config.verification_similarity_thresh:
-                self.stats["retrieval_threshold_rejects"] += 1
+                if not silent:
+                    self.stats["retrieval_threshold_rejects"] += 1
                 event.update(
                     {
                         "archive_id": entry.archive_id,
@@ -230,7 +348,8 @@ class MemoryRouter:
                 )
                 continue
             if state_sim > self.config.max_state_similarity_for_recover:
-                self.stats["retrieval_redundant_skips"] += 1
+                if not silent:
+                    self.stats["retrieval_redundant_skips"] += 1
                 event.update(
                     {
                         "archive_id": entry.archive_id,
@@ -244,7 +363,8 @@ class MemoryRouter:
                 )
                 continue
             if sequence_sim < self.config.sequence_similarity_thresh:
-                self.stats["retrieval_sequence_rejects"] += 1
+                if not silent:
+                    self.stats["retrieval_sequence_rejects"] += 1
                 event.update(
                     {
                         "archive_id": entry.archive_id,
@@ -258,7 +378,8 @@ class MemoryRouter:
                 )
                 continue
             if gap < self.config.query_state_gap_thresh:
-                self.stats["retrieval_gap_rejects"] += 1
+                if not silent:
+                    self.stats["retrieval_gap_rejects"] += 1
                 event.update(
                     {
                         "archive_id": entry.archive_id,
@@ -292,8 +413,9 @@ class MemoryRouter:
             )
 
         if not selected_candidates:
-            self.events.append(event)
-            return []
+            if not silent:
+                self.events.append(event)
+            return [], attempted
 
         selected_candidates.sort(
             key=lambda proposal: (
@@ -303,7 +425,7 @@ class MemoryRouter:
             ),
             reverse=True,
         )
-        return selected_candidates
+        return selected_candidates, attempted
 
     def record_geometry_verification(
         self,
@@ -666,6 +788,10 @@ class MemoryRouter:
         while len(self.archive_bank) > self.config.max_archives:
             self.archive_bank.pop(0)
             self.stats["evicted_archives"] += 1
+
+        self._last_archived_segment_desc = entry.descriptor.detach().clone()
+        if self._hierarchical_bank is not None:
+            self._hierarchical_bank.register_entry(entry.archive_id, entry.descriptor)
 
         self.segment_start = frame_idx + 1
         self.segment_descriptors = []

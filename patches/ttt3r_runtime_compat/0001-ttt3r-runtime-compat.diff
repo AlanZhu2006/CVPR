@@ -1,0 +1,224 @@
+diff --git a/eval/relpose/evo_utils.py b/eval/relpose/evo_utils.py
+index 75f5d67..e6676ed 100644
+--- a/eval/relpose/evo_utils.py
++++ b/eval/relpose/evo_utils.py
+@@ -8,9 +8,10 @@ import evo.main_rpe as main_rpe
+ import matplotlib.pyplot as plt
+ import numpy as np
+ from evo.core import sync
++from evo.core.geometry import GeometryException
+ from evo.core.metrics import PoseRelation, Unit
+ from evo.core.trajectory import PosePath3D, PoseTrajectory3D
+-from evo.tools import file_interface, plot
++from evo.tools import file_interface
+ from scipy.spatial.transform import Rotation
+ from evo.core import metrics
+ import json
+@@ -224,14 +225,24 @@ def eval_metrics(pred_traj, gt_traj=None, seq="", filename="", sample_stride=1):
+     traj_ref = gt_traj
+     traj_est = pred_traj
+ 
+-    ate_result = main_ape.ape(
+-        traj_ref,
+-        traj_est,
+-        est_name="traj",
+-        pose_relation=PoseRelation.translation_part,
+-        align=True,
+-        correct_scale=True,
+-    )
++    try:
++        ate_result = main_ape.ape(
++            traj_ref,
++            traj_est,
++            est_name="traj",
++            pose_relation=PoseRelation.translation_part,
++            align=True,
++            correct_scale=True,
++        )
++    except GeometryException:
++        ate_result = main_ape.ape(
++            traj_ref,
++            traj_est,
++            est_name="traj",
++            pose_relation=PoseRelation.translation_part,
++            align=False,
++            correct_scale=False,
++        )
+ 
+     ate = ate_result.stats["rmse"]
+     # print(ate_result.np_arrays['error_array'])
+@@ -241,35 +252,63 @@ def eval_metrics(pred_traj, gt_traj=None, seq="", filename="", sample_stride=1):
+     delta_list = [1]
+     rpe_rots, rpe_transs = [], []
+     for delta in delta_list:
+-        rpe_rots_result = main_rpe.rpe(
+-            traj_ref,
+-            traj_est,
+-            est_name="traj",
+-            pose_relation=PoseRelation.rotation_angle_deg,
+-            align=True,
+-            correct_scale=True,
+-            delta=delta,
+-            delta_unit=Unit.frames,
+-            rel_delta_tol=0.01,
+-            all_pairs=True,
+-        )
++        try:
++            rpe_rots_result = main_rpe.rpe(
++                traj_ref,
++                traj_est,
++                est_name="traj",
++                pose_relation=PoseRelation.rotation_angle_deg,
++                align=True,
++                correct_scale=True,
++                delta=delta,
++                delta_unit=Unit.frames,
++                rel_delta_tol=0.01,
++                all_pairs=True,
++            )
++        except GeometryException:
++            rpe_rots_result = main_rpe.rpe(
++                traj_ref,
++                traj_est,
++                est_name="traj",
++                pose_relation=PoseRelation.rotation_angle_deg,
++                align=False,
++                correct_scale=False,
++                delta=delta,
++                delta_unit=Unit.frames,
++                rel_delta_tol=0.01,
++                all_pairs=True,
++            )
+ 
+         rot = rpe_rots_result.stats["rmse"]
+         rpe_rots.append(rot)
+ 
+     for delta in delta_list:
+-        rpe_transs_result = main_rpe.rpe(
+-            traj_ref,
+-            traj_est,
+-            est_name="traj",
+-            pose_relation=PoseRelation.translation_part,
+-            align=True,
+-            correct_scale=True,
+-            delta=delta,
+-            delta_unit=Unit.frames,
+-            rel_delta_tol=0.01,
+-            all_pairs=True,
+-        )
++        try:
++            rpe_transs_result = main_rpe.rpe(
++                traj_ref,
++                traj_est,
++                est_name="traj",
++                pose_relation=PoseRelation.translation_part,
++                align=True,
++                correct_scale=True,
++                delta=delta,
++                delta_unit=Unit.frames,
++                rel_delta_tol=0.01,
++                all_pairs=True,
++            )
++        except GeometryException:
++            rpe_transs_result = main_rpe.rpe(
++                traj_ref,
++                traj_est,
++                est_name="traj",
++                pose_relation=PoseRelation.translation_part,
++                align=False,
++                correct_scale=False,
++                delta=delta,
++                delta_unit=Unit.frames,
++                rel_delta_tol=0.01,
++                all_pairs=True,
++            )
+ 
+         trans = rpe_transs_result.stats["rmse"]
+         rpe_transs.append(trans)
+@@ -362,6 +401,8 @@ def eval_metrics_first_pose_align_last_pose(
+ 
+ 
+ def best_plotmode(traj):
++    from evo.tools import plot
++
+     _, i1, i2 = np.argsort(np.var(traj.positions_xyz, axis=0))
+     plot_axes = "xyz"[i2] + "xyz"[i1]
+     return getattr(plot.PlotMode, plot_axes)
+@@ -370,6 +411,12 @@ def best_plotmode(traj):
+ def plot_trajectory(
+     pred_traj, gt_traj=None, title="", filename="", align=True, correct_scale=True
+ ):
++    try:
++        from evo.tools import plot
++    except ImportError as exc:
++        print(f"Skipping trajectory plot (evo/matplotlib): {exc}")
++        return
++
+     pred_traj = make_traj(pred_traj)
+ 
+     if gt_traj is not None:
+diff --git a/src/croco/models/pos_embed.py b/src/croco/models/pos_embed.py
+index 0f76e4d..88ed63d 100644
+--- a/src/croco/models/pos_embed.py
++++ b/src/croco/models/pos_embed.py
+@@ -151,9 +151,16 @@ except ImportError:
+ 
+         def apply_rope1d(self, tokens, pos1d, cos, sin):
+             assert pos1d.ndim == 2
+-            cos = torch.nn.functional.embedding(pos1d, cos)[:, None, :, :]
+-            sin = torch.nn.functional.embedding(pos1d, sin)[:, None, :, :]
+-            return (tokens * cos) + (self.rotate_half(tokens) * sin)
++            # Pose / sentinel tokens use position -1 (see dust3r recurrent rollout). cuRoPE2D
++            # handles this in CUDA; for this PyTorch fallback, skip RoPE where pos < 0.
++            valid = pos1d >= 0
++            pos_safe = pos1d.clamp(min=0)
++            cos_sel = torch.nn.functional.embedding(pos_safe, cos)[:, None, :, :]
++            sin_sel = torch.nn.functional.embedding(pos_safe, sin)[:, None, :, :]
++            rotated = (tokens * cos_sel) + (self.rotate_half(tokens) * sin_sel)
++            # tokens: (B, nheads, N, dim); valid: (B, N)
++            valid_m = valid[:, None, :, None].to(dtype=tokens.dtype)
++            return valid_m * rotated + (1.0 - valid_m) * tokens
+ 
+         def forward(self, tokens, positions):
+             """
+@@ -168,9 +175,12 @@ except ImportError:
+             ), "number of dimensions should be a multiple of two"
+             D = tokens.size(3) // 2
+             assert positions.ndim == 3 and positions.shape[-1] == 2  # Batch, Seq, 2
+-            cos, sin = self.get_cos_sin(
+-                D, int(positions.max()) + 1, tokens.device, tokens.dtype
+-            )
++            nonneg = positions >= 0
++            if nonneg.any():
++                seq_len = int(positions[nonneg].max().item()) + 1
++            else:
++                seq_len = 1
++            cos, sin = self.get_cos_sin(D, seq_len, tokens.device, tokens.dtype)
+             # split features into two along the feature dimension, and apply rope1d on each half
+             y, x = tokens.chunk(2, dim=-1)
+             y = self.apply_rope1d(y, positions[:, :, 0], cos, sin)
+diff --git a/src/dust3r/model.py b/src/dust3r/model.py
+index 503c7bc..e030844 100644
+--- a/src/dust3r/model.py
++++ b/src/dust3r/model.py
+@@ -1,5 +1,6 @@
+ import sys
+ import os
++import inspect
+ 
+ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+ from collections import OrderedDict
+@@ -74,7 +75,12 @@ def strip_module(state_dict):
+ def load_model(model_path, device, verbose=True):
+     if verbose:
+         print("... loading model from", model_path)
+-    ckpt = torch.load(model_path, map_location="cpu")
++    # PyTorch >=2.6 defaults torch.load(..., weights_only=True); legacy checkpoints
++    # store omegaconf objects and fail the safe unpickler — use full unpickle for trusted weights.
++    load_kw = {"map_location": "cpu"}
++    if "weights_only" in inspect.signature(torch.load).parameters:
++        load_kw["weights_only"] = False
++    ckpt = torch.load(model_path, **load_kw)
+     args = ckpt["args"].model.replace(
+         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
+     )  # ManyAR only for aspect ratio not consistent

@@ -5,8 +5,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "${ROOT_DIR}/checkpoints"
 
-if ! command -v gdown >/dev/null 2>&1; then
-  pip install gdown
+if ! python3 -m gdown --version >/dev/null 2>&1; then
+  python3 -m pip install --user gdown
 fi
 
 TARGET="${ROOT_DIR}/checkpoints/cut3r_512_dpt_4_64.pth"
@@ -20,5 +20,6 @@ if [[ -f "${TARGET}" ]]; then
   echo "Resuming partial checkpoint download at ${TARGET}"
 fi
 
-gdown --continue --fuzzy "https://drive.google.com/file/d/1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD/view?usp=drive_link" -O "${TARGET}"
+# Use `python3 -m gdown` so we pick up the pip module (system `gdown` may be an old stub without --fuzzy).
+python3 -m gdown --continue "1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD" -O "${TARGET}"
 echo "Downloaded checkpoint to ${TARGET}"

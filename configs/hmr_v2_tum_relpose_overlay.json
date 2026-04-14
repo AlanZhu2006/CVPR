@@ -1,0 +1,18 @@
+{
+  "enable_v2_write_gate": true,
+  "write_min_segment_novelty": 0.0,
+  "enable_v2_recover_gate": true,
+  "recover_geo_gain_soft_thresh": 0.0,
+  "recover_conf_delta_soft_thresh": -1e9,
+  "recover_alpha_scale_on_low_geo_gain": 0.85,
+  "recover_alpha_scale_on_low_conf_delta": 1.0,
+  "recover_min_effective_alpha": 0.0,
+  "enable_v2_hierarchy": true,
+  "hierarchy_top_scenes": 2,
+  "hierarchy_max_scenes": 16,
+  "enable_v2_merge": true,
+  "merge_softmax_temperature": 1.0,
+  "enable_v2_local_adapt": true,
+  "local_adapt_lr": 0.03,
+  "local_adapt_steps": 1
+}

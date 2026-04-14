@@ -6,8 +6,12 @@ from typing import Dict, List, Tuple
 import torch
 from einops import rearrange
 
+from .adaptation.local_adapt import apply_local_adaptation
+from .anchor_gate import should_accept_anchor_pose_candidate as _should_accept_anchor_pose_candidate
 from .config import MemoryConfig
 from .mem3r_probe import Mem3RLikeRuntime
+from .policies.merge_policy import MergePolicy
+from .policies.recover_policy import RecoverPolicy
 from .router import MemoryRouter, RecoveryProposal
 from .ttt3r_env import bootstrap_ttt3r_imports
 from .ttt3r_io import compute_anchor_pose_quality, compute_prediction_quality, extract_camera_pose_matrix
@@ -157,32 +161,6 @@ def _should_commit_shadow_recovery(
         >= 0.0
     )
     return geo_ok and conf_ok
-
-
-def _should_accept_anchor_pose_candidate(
-    *,
-    proposal: RecoveryProposal,
-    baseline_anchor_quality: Dict[str, float] | None,
-    candidate_anchor_quality: Dict[str, float] | None,
-    cfg: MemoryConfig,
-) -> bool:
-    if not cfg.enable_anchor_pose_verification:
-        return True
-    if cfg.anchor_pose_only_for_ambiguous:
-        is_ambiguous = (
-            proposal.candidate_rank >= cfg.verification_ambiguity_rank_threshold
-            or abs(proposal.query_state_gap) < cfg.verification_ambiguity_gap_thresh
-            or not proposal.is_latest_archive
-        )
-        if not is_ambiguous:
-            return True
-    if baseline_anchor_quality is None or candidate_anchor_quality is None:
-        return False
-    baseline_score = baseline_anchor_quality["anchor_score"]
-    candidate_score = candidate_anchor_quality["anchor_score"]
-    ratio_ok = candidate_score <= baseline_score * cfg.anchor_pose_score_ratio_thresh
-    gain_ok = (baseline_score - candidate_score) >= cfg.anchor_pose_min_score_gain
-    return ratio_ok and gain_ok
 
 
 def _run_step(
@@ -438,7 +416,11 @@ def run_sequence_with_mode(
 
             outputs.append(to_cpu(chosen_step.result))
             reset_mask = gpu_view["reset"]
-            if router is not None and pending_shadow is None and router.should_archive(frame_idx):
+            if router is not None and pending_shadow is None and router.can_archive(
+                frame_idx,
+                (state_feat, state_pos, init_state_feat, mem, init_mem),
+                optional_state_conf=compute_prediction_quality(chosen_step.result).get("mean_log_conf"),
+            ):
                 router.archive(
                     frame_idx,
                     (state_feat, state_pos, init_state_feat, mem, init_mem),
@@ -506,6 +488,9 @@ def run_sequence_with_mode(
                 accepted_quality = None
                 accepted_baseline_anchor_quality = None
                 accepted_anchor_quality = None
+                accepted_bundle: list[
+                    tuple[RecoveryProposal, StepResult, Dict, Dict | None, Dict | None]
+                ] = []
                 for proposal in proposals:
                     required_geo_gain = _required_geo_gain_for_proposal(proposal, cfg)
                     proposal_state_feat, proposal_state_pos, proposal_init_state_feat, proposal_mem, proposal_init_mem = (
@@ -549,12 +534,15 @@ def run_sequence_with_mode(
                         candidate_anchor_quality=candidate_anchor_quality,
                         cfg=cfg,
                     ):
-                        if accepted_quality is None or candidate_quality["geo_rmse"] < accepted_quality["geo_rmse"]:
-                            accepted_proposal = proposal
-                            accepted_step = candidate_step
-                            accepted_quality = candidate_quality
-                            accepted_baseline_anchor_quality = baseline_anchor_quality
-                            accepted_anchor_quality = candidate_anchor_quality
+                        accepted_bundle.append(
+                            (
+                                proposal,
+                                candidate_step,
+                                candidate_quality,
+                                baseline_anchor_quality,
+                                candidate_anchor_quality,
+                            )
+                        )
                     else:
                         router.reject_recovery(
                             frame_idx,
@@ -573,6 +561,129 @@ def run_sequence_with_mode(
                             ),
                             reason="rejected_by_geometry_or_anchor_verification",
                         )
+
+                if accepted_bundle:
+                    if cfg.enable_v2_merge and len(accepted_bundle) > 1:
+                        merge_pol = MergePolicy(cfg)
+                        props = [b[0] for b in accepted_bundle]
+                        geos = [b[2]["geo_rmse"] for b in accepted_bundle]
+                        bundle = merge_pol.merge(props, geos)
+                        router.stats["merge_events"] += 1
+                        ref0 = props[0]
+                        mean_alpha = sum(
+                            float(w) * float(p.recovery_alpha) for w, p in zip(bundle.blend_weights, props)
+                        )
+                        synth = RecoveryProposal(
+                            archive_id=ref0.archive_id,
+                            archive_frame_idx=ref0.archive_frame_idx,
+                            candidate_rank=ref0.candidate_rank,
+                            query_similarity=ref0.query_similarity,
+                            state_similarity=ref0.state_similarity,
+                            sequence_similarity=ref0.sequence_similarity,
+                            query_state_gap=ref0.query_state_gap,
+                            recovery_alpha=float(mean_alpha),
+                            is_latest_archive=ref0.is_latest_archive,
+                            archive_camera_pose=ref0.archive_camera_pose,
+                            state_args=(
+                                bundle.state_feat,
+                                ref0.state_args[1],
+                                ref0.state_args[2],
+                                bundle.mem,
+                                ref0.state_args[4],
+                            ),
+                        )
+                        accepted_step = _run_step(
+                            model=model,
+                            gpu_view=gpu_view,
+                            shape=shape,
+                            feat_i=feat_i,
+                            pos_i=pos_i,
+                            state_feat=synth.state_args[0],
+                            state_pos=synth.state_args[1],
+                            init_state_feat=synth.state_args[2],
+                            mem=synth.state_args[3],
+                            init_mem=synth.state_args[4],
+                            reset_mask=reset_mask,
+                            cfg=cfg,
+                            mem3r_runtime=None,
+                            frame_idx=frame_idx,
+                        )
+                        accepted_quality = compute_prediction_quality(accepted_step.result)
+                        accepted_proposal = synth
+                        accepted_baseline_anchor_quality = accepted_bundle[0][3]
+                        accepted_anchor_quality = accepted_bundle[0][4]
+                    else:
+                        best_tup = min(accepted_bundle, key=lambda b: b[2]["geo_rmse"])
+                        (
+                            accepted_proposal,
+                            accepted_step,
+                            accepted_quality,
+                            accepted_baseline_anchor_quality,
+                            accepted_anchor_quality,
+                        ) = best_tup
+
+                    recover_pol = RecoverPolicy(cfg)
+                    geo_gain = baseline_quality["geo_rmse"] - accepted_quality["geo_rmse"]
+                    conf_delta = accepted_quality["mean_log_conf"] - baseline_quality["mean_log_conf"]
+                    rd = recover_pol.decide_after_verify(
+                        accepted_proposal,
+                        geo_gain=geo_gain,
+                        conf_delta=conf_delta,
+                        baseline_anchor_score=(
+                            accepted_baseline_anchor_quality["anchor_score"]
+                            if accepted_baseline_anchor_quality is not None
+                            else None
+                        ),
+                        candidate_anchor_score=(
+                            accepted_anchor_quality["anchor_score"] if accepted_anchor_quality is not None else None
+                        ),
+                    )
+                    if not rd.allow:
+                        router.stats["recover_gate_blocks"] += 1
+                        router.reject_recovery(
+                            frame_idx,
+                            accepted_proposal,
+                            baseline_geo_rmse=baseline_quality["geo_rmse"],
+                            baseline_conf=baseline_quality["mean_log_conf"],
+                            candidate_geo_rmse=accepted_quality["geo_rmse"],
+                            candidate_conf=accepted_quality["mean_log_conf"],
+                            baseline_anchor_score=(
+                                accepted_baseline_anchor_quality["anchor_score"]
+                                if accepted_baseline_anchor_quality is not None
+                                else None
+                            ),
+                            candidate_anchor_score=(
+                                accepted_anchor_quality["anchor_score"]
+                                if accepted_anchor_quality is not None
+                                else None
+                            ),
+                            reason="rejected_by_recover_gate",
+                        )
+                        accepted_proposal = None
+                        accepted_step = None
+                        accepted_quality = None
+                    elif abs(rd.effective_alpha - accepted_proposal.recovery_alpha) > 1e-6:
+                        accepted_proposal = router.rebuild_proposal_with_alpha(
+                            accepted_proposal, state_feat, mem, rd.effective_alpha
+                        )
+                        accepted_step = _run_step(
+                            model=model,
+                            gpu_view=gpu_view,
+                            shape=shape,
+                            feat_i=feat_i,
+                            pos_i=pos_i,
+                            state_feat=accepted_proposal.state_args[0],
+                            state_pos=accepted_proposal.state_args[1],
+                            init_state_feat=accepted_proposal.state_args[2],
+                            mem=accepted_proposal.state_args[3],
+                            init_mem=accepted_proposal.state_args[4],
+                            reset_mask=reset_mask,
+                            cfg=cfg,
+                            mem3r_runtime=None,
+                            frame_idx=frame_idx,
+                        )
+                        accepted_quality = compute_prediction_quality(accepted_step.result)
+                        router.stats["recover_gate_alpha_reduced"] += 1
 
                 if accepted_proposal is not None and accepted_step is not None and accepted_quality is not None:
                     if cfg.enable_shadow_recovery and cfg.shadow_recovery_window > 0:
@@ -629,26 +740,39 @@ def run_sequence_with_mode(
                                 else None
                             ),
                         )
+                        if cfg.enable_v2_local_adapt:
+                            ns, nm = apply_local_adaptation(
+                                cfg,
+                                chosen_step.next_state_feat,
+                                chosen_step.next_mem,
+                                accepted_proposal.state_args[0],
+                                accepted_proposal.state_args[3],
+                            )
+                            chosen_step = StepResult(result=chosen_step.result, next_state_feat=ns, next_mem=nm)
+                            router.stats["local_adapt_applied"] += 1
                 else:
-                    best_proposal = proposals[0] if proposals else None
-                    if best_proposal is not None:
-                        baseline_anchor_quality = compute_anchor_pose_quality(
-                            baseline_step.result,
-                            best_proposal.archive_camera_pose,
-                            rotation_weight=cfg.anchor_pose_rotation_weight,
+                    if not accepted_bundle:
+                        best_proposal = proposals[0] if proposals else None
+                        if best_proposal is not None:
+                            baseline_anchor_quality = compute_anchor_pose_quality(
+                                baseline_step.result,
+                                best_proposal.archive_camera_pose,
+                                rotation_weight=cfg.anchor_pose_rotation_weight,
+                            )
+                        else:
+                            baseline_anchor_quality = None
+                        router.reject_recovery(
+                            frame_idx,
+                            best_proposal,
+                            baseline_geo_rmse=baseline_quality["geo_rmse"],
+                            baseline_conf=baseline_quality["mean_log_conf"],
+                            baseline_anchor_score=(
+                                baseline_anchor_quality["anchor_score"]
+                                if baseline_anchor_quality is not None
+                                else None
+                            ),
+                            reason="rejected_by_geometry_or_anchor_verification",
                         )
-                    else:
-                        baseline_anchor_quality = None
-                    router.reject_recovery(
-                        frame_idx,
-                        best_proposal,
-                        baseline_geo_rmse=baseline_quality["geo_rmse"],
-                        baseline_conf=baseline_quality["mean_log_conf"],
-                        baseline_anchor_score=(
-                            baseline_anchor_quality["anchor_score"] if baseline_anchor_quality is not None else None
-                        ),
-                        reason="rejected_by_geometry_or_anchor_verification",
-                    )
 
         outputs.append(to_cpu(chosen_step.result))
         state_feat = chosen_step.next_state_feat
@@ -656,7 +780,11 @@ def run_sequence_with_mode(
 
         reset_mask = gpu_view["reset"]
 
-        if router is not None and pending_shadow is None and router.should_archive(frame_idx):
+        if router is not None and pending_shadow is None and router.can_archive(
+            frame_idx,
+            (state_feat, state_pos, init_state_feat, mem, init_mem),
+            optional_state_conf=compute_prediction_quality(chosen_step.result).get("mean_log_conf"),
+        ):
             router.archive(
                 frame_idx,
                 (state_feat, state_pos, init_state_feat, mem, init_mem),
@@ -698,6 +826,14 @@ def run_sequence_with_mode(
         "avg_shadow_recovery_conf_delta": 0.0,
         "avg_shadow_recovery_frames": 0.0,
         "evicted_archives": 0,
+        "write_gate_accepts": 0,
+        "write_gate_rejects": 0,
+        "write_gate_delays": 0,
+        "coarse_miss_fallback_full_scan": 0,
+        "recover_gate_blocks": 0,
+        "recover_gate_alpha_reduced": 0,
+        "merge_events": 0,
+        "local_adapt_applied": 0,
     }
     if router is not None:
         memory_stats["events"] = router.events

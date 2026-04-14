@@ -45,6 +45,34 @@ class MemoryConfig:
     enable_retrieval: bool = True
     reset_on_archive: bool = False
 
+    # --- HMR3D v2: write / recover gates (defaults preserve v1 behaviour) ---
+    enable_v2_write_gate: bool = False
+    write_min_segment_novelty: float = 0.0
+    write_min_state_confidence: float = 0.0
+    write_delay_frames_on_low_conf: int = 0
+    archive_quality_score_thresh: float = 0.0
+
+    enable_v2_recover_gate: bool = False
+    recover_max_injection_alpha: float = 1.0
+    recover_min_pose_agreement: float = 0.0
+    recover_geo_gain_soft_thresh: float = 0.0
+    recover_conf_delta_soft_thresh: float = -1e9
+    recover_alpha_scale_on_low_geo_gain: float = 1.0
+    recover_alpha_scale_on_low_conf_delta: float = 1.0
+    recover_min_effective_alpha: float = 0.0
+    recover_blend_with_identity: bool = True
+
+    enable_v2_hierarchy: bool = False
+    hierarchy_top_scenes: int = 2
+    hierarchy_max_scenes: int = 16
+
+    enable_v2_merge: bool = False
+    merge_softmax_temperature: float = 1.0
+
+    enable_v2_local_adapt: bool = False
+    local_adapt_steps: int = 1
+    local_adapt_lr: float = 0.05
+
     @classmethod
     def from_dict(cls, payload: Dict[str, Any] | None) -> "MemoryConfig":
         if payload is None:
@@ -71,6 +99,20 @@ class MemoryConfig:
             cfg.enable_archive = False
             cfg.enable_retrieval = False
             cfg.base_update_type = mode
+        elif mode == "hmr_v2_writegate":
+            cfg.enable_archive = True
+            cfg.enable_retrieval = True
+            cfg.base_update_type = "ttt3r"
+            cfg.enable_v2_write_gate = True
+        elif mode == "hmr_v2_full":
+            cfg.enable_archive = True
+            cfg.enable_retrieval = True
+            cfg.base_update_type = "ttt3r"
+            cfg.enable_v2_write_gate = True
+            cfg.enable_v2_recover_gate = True
+            cfg.enable_v2_hierarchy = True
+            cfg.enable_v2_merge = True
+            cfg.enable_v2_local_adapt = True
         else:
             raise ValueError(f"Unsupported mode: {mode}")
         return cfg

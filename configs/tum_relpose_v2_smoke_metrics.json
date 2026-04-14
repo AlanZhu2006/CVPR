@@ -1,0 +1,39 @@
+{
+  "weights": "checkpoints/cut3r_512_dpt_4_64.pth",
+  "dataset": "tum_s1_1000",
+  "output_root": "reports/generated/tum_relpose_v2_smoke_metrics",
+  "size": 224,
+  "device": "cpu",
+  "max_seqs": 1,
+  "seq_list": ["smoke_seq"],
+  "deterministic": true,
+  "seed": 0,
+  "baseline_trial": "ttt3r_smoke",
+  "memory": {
+    "archive_interval": 4,
+    "max_archives": 16,
+    "retrieval_topk": 3,
+    "retrieval_similarity_thresh": 0.88,
+    "verification_similarity_thresh": 0.78,
+    "recovery_alpha": 0.45,
+    "min_frames_before_retrieve": 2,
+    "retrieval_cooldown": 0,
+    "retrieval_attempt_cooldown": 0,
+    "base_update_type": "ttt3r"
+  },
+  "trials": [
+    { "name": "ttt3r_smoke", "mode": "ttt3r" },
+    {
+      "name": "hmr_full_v1_smoke",
+      "mode": "hmr_full",
+      "memory": {
+        "enable_v2_write_gate": false,
+        "enable_v2_recover_gate": false,
+        "enable_v2_hierarchy": false,
+        "enable_v2_merge": false,
+        "enable_v2_local_adapt": false
+      }
+    },
+    { "name": "hmr_v2_full_smoke", "mode": "hmr_v2_full" }
+  ]
+}

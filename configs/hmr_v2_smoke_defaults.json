@@ -1,0 +1,8 @@
+{
+  "archive_interval": 120,
+  "enable_v2_write_gate": false,
+  "enable_v2_recover_gate": false,
+  "enable_v2_hierarchy": false,
+  "enable_v2_merge": false,
+  "enable_v2_local_adapt": false
+}
