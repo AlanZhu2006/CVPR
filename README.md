@@ -41,7 +41,9 @@ python scripts/run_relpose_memory_sweep.py --config configs/tum_relpose_mem3r_ru
 python scripts/export_mem3r_scaffold.py --weights checkpoints/cut3r_512_dpt_4_64.pth
 ```
 
-HPC handoff notes are in [docs/mem3r_hpc_handoff.md](/home/pengyue/Codespace/HMR3D/docs/mem3r_hpc_handoff.md).
+HPC handoff notes are in [docs/mem3r_hpc_handoff.md](docs/mem3r_hpc_handoff.md).
+
+GPU 机器拉仓后的步骤与「训练」路线图说明见 [docs/gpu_setup_and_training_next_steps.md](docs/gpu_setup_and_training_next_steps.md).
 
 ## Notes
 

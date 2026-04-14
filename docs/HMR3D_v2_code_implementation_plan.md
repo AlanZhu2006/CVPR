@@ -434,4 +434,6 @@ local_adapt_lr_max: float = 1e-3
    `python3 scripts/print_relpose_leaderboard.py reports/generated/tum_relpose_v2_smoke_metrics/leaderboard.json`  
    会生成 `METRICS_TABLE.md` / `METRICS_TABLE.tsv`。短序列上 **ATE 可能与 v1 相同**；请看各 trial 目录下 `smoke_seq/memory_stats.json` 里的 **`write_gate_*`、`recover_gate_*`、`merge_events`、`local_adapt_applied`** 等 v2 计数是否按预期变化。真实 ~8% ATE 类结论需 **`configs/tum_relpose_sweep_224_v7_geometry_multi_tum.json`** 与完整 `data/long_tum_s1`。
 
+**GPU 拉仓、补丁、训练/下一步总览**：见 [gpu_setup_and_training_next_steps.md](gpu_setup_and_training_next_steps.md)。
+
 **测 v2 在 TUM 相对位姿上的效果：** 在现有 sweep 的 JSON 里 merge 进 `configs/hmr_v2_tum_relpose_overlay.json`（或把其中字段拷进你的 manifest），并把 `mode` 设为 `hmr_full` 或继续用 `hmr_full` + `memory` 字段覆盖；若 sweep 脚本支持 `hmr_v2_full` mode，可直接切到该 mode。对比同一 manifest 下 **overlay 全关 vs 全开** 的 ATE 曲线即可。真实 TUM 长序列仍用 `configs/tum_relpose_sweep_224_v2_ablation.json`（需自备 `data/long_tum_s1/...`）；无数据时可用 `configs/tum_relpose_smoke_fixture.json` 做端到端冒烟。
