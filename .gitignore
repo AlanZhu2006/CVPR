@@ -1,13 +1,16 @@
-latex/*.aux
-latex/*.log
-latex/*.out
-latex/*.toc
-latex/*.fdb_latexmk
-latex/*.fls
-latex/*.synctex.gz
-TTT3R/demo_tmp/
-.venv-nuc/
-nuc_output/
-nuc/.cache/
-**/__pycache__/
+# Workspace-local environments and build artifacts
+GS_Console/
+cuVSLAM/.venv-jetson/
+cuVSLAM/build/
+cuVSLAM/outputs/
+HMR3D/nuc_output/
+
+# Nested repositories should be copied as plain files only
+**/.git/
+
+# Large local datasets / generated maps
+cuVSLAM/examples/kitti/dataset/sequences/06/map/data.mdb
+
+# Python cache
+__pycache__/
 *.pyc

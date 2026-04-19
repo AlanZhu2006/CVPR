@@ -1,0 +1,66 @@
+input:
+  frame_step: 5
+  max_frames: 200
+
+memory:
+  enable_v2_write_policy: true
+  enable_pose_anchor_gate: true
+  enable_shadow_recover: true
+  enable_hierarchical_bank: true
+  enable_multi_candidate_merge: true
+  enable_local_adapt: true
+  enable_incremental_gaussian: true
+  gaussian_warmstart_max_points: 192
+  gaussian_stereo_grid_stride: 10
+  gaussian_stereo_num_disparities: 96
+  gaussian_stereo_block_size: 5
+  gaussian_stereo_min_disparity_px: 1.0
+  gaussian_stereo_max_depth_m: 50.0
+  gaussian_stereo_max_points_per_frame: 1800
+  gaussian_stereo_stride_scale: 0.82
+  gaussian_pair_stride_scale: 0.6
+  gaussian_stereo_feature_points: 900
+  gaussian_stereo_consistency_threshold_px: 1.2
+  gaussian_stereo_texture_threshold: 5.0
+  gaussian_stereo_fusion_voxel_size: 0.085
+  gaussian_stereo_quadtree_min_block: 24
+  gaussian_stereo_quadtree_var_threshold: 0.35
+  gaussian_stereo_depth_edge_threshold: 1.1
+  gaussian_optimize_steps: 4
+  gaussian_optimize_window: 4
+  gaussian_optimize_lr_position: 0.10
+  gaussian_optimize_lr_scale: 0.07
+  gaussian_optimize_lr_opacity: 0.10
+  gaussian_optimize_lr_color: 0.24
+  gaussian_optimize_topk: 6000
+  gaussian_optimize_error_threshold: 18.0
+  gaussian_optimize_unstable_decay: 0.88
+  gaussian_optimize_new_point_boost: 0.45
+  gaussian_optimize_recover_boost: 0.65
+  gaussian_optimize_depth_weight: 0.72
+  gaussian_optimize_depth_score_weight: 0.9
+  gaussian_optimize_depth_gate_m: 1.6
+  gaussian_coarse_voxel_size: 0.45
+  gaussian_coarse_max_points: 1200
+  gaussian_full_recent_archives: 2
+
+output:
+  output_dir: nuc_output/kitti06_render_benchmark_v5_quality_fused
+  render_save_images: true
+  render_compare_stride: 5
+  render_max_archived_submaps: 8
+  render_min_radius_px: 1.4
+  render_max_radius_px: 18.0
+  render_enable_hole_fill: true
+  render_hole_fill_kernel: 7
+  render_hole_fill_max_area: 2048
+  render_depth_soften: 0.96
+  render_internal_scale: 0.42
+  render_tile_size: 56
+  render_max_active_points: 22000
+  render_depth_window_m: 45.0
+  render_max_archived_points: 5000
+  render_max_warmstart_points: 1200
+  render_view_budget_points: 9000
+  render_surface_depth_sigma: 0.22
+  render_surface_opacity_gain: 1.28

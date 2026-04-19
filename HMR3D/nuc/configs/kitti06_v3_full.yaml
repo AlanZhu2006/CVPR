@@ -1,0 +1,53 @@
+input:
+  frame_step: 5
+  max_frames: 400
+
+tracking:
+  max_features: 2000
+  min_matches: 40
+  min_pose_inliers: 16
+  ratio_test: 0.75
+  min_keyframe_gap: 3
+  max_keyframe_gap: 15
+  keyframe_motion_threshold: 18.0
+  low_match_keyframe_threshold: 80
+  min_translation_step: 0.05
+  max_translation_step: 0.5
+
+memory:
+  short_window_size: 20
+  active_max_keyframes: 12
+  active_max_age: 120
+  active_max_distance: 2.5
+  active_similarity_floor: 0.72
+  archive_min_keyframes: 3
+  archive_min_mean_match_count: 100.0
+  archive_min_mean_descriptor_score: 0.78
+  anchor_topk: 3
+  retrieve_topk: 3
+  retrieve_similarity_threshold: 0.82
+  retrieve_cooldown_frames: 20
+  geo_verify_min_matches: 25
+  enable_recover: true
+  enable_v2_write_policy: true
+  enable_pose_anchor_gate: true
+  pose_anchor_translation_threshold: 20.0
+  pose_anchor_rotation_threshold_deg: 15.0
+  enable_shadow_recover: true
+  shadow_promote_min_matches: 30
+  shadow_similarity_threshold: 0.88
+  enable_hierarchical_bank: true
+  scene_summary_distance_threshold: 35.0
+  scene_summary_max_entries: 4
+  scene_topk: 2
+  enable_multi_candidate_merge: true
+  merge_topk: 3
+  merge_min_candidates: 2
+  merge_support_translation_ratio: 2.0
+  merge_support_rotation_ratio: 2.0
+  merge_support_similarity_floor: 0.9
+  enable_local_adapt: true
+  local_adapt_descriptor_gain: 0.35
+
+output:
+  output_dir: /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_v3_full

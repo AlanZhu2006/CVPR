@@ -1,433 +1,532 @@
-# HMR3D：分层记忆长程在线三维重建
+# CVPR Workspace: cuVSLAM + HMR3D + Streaming Gaussian
 
-**更新时间：2026-04-13**
+这个工作区当前的主线，不是单独做一个离线高质量 Gaussian 重建器，而是构建一条更偏系统的路线：
 
-本仓库以 **HMR3D**（*Hierarchical Memory Reconstruction for 3D*）为主线：在固定算力与显存预算下，把在线重建从**单一 recurrent / 全局地图状态**，升级为**短程 — 活动 — 归档 — 路由**的显式 **memory lifecycle**（`archive / retrieve / recover`），而不是再堆一个语义头或换一套巨型 backbone。
+- `cuVSLAM` 负责低延迟 tracking / mapping 前端
+- `HMR3D` 负责长期记忆生命周期
+- `Gaussian` 负责 active region 的局部表示与渲染
 
----
+目标是把它做成一个 **memory-native Gaussian system**：
 
-## 目录
+> 机器人边走边 tracking，边维护当前 active Gaussian submap，边把历史区域 archive 成长期记忆，并在回到旧区域时 retrieve / recover 历史高斯子图。
 
-1. [核心命题与一句话定位](#1-核心命题与一句话定位)  
-2. [文档与报告索引（建议阅读顺序）](#2-文档与报告索引建议阅读顺序)  
-3. [仓库结构](#3-仓库结构)  
-4. [Git：克隆方式与 main / master 分支说明](#4-git克隆方式与-main--master-分支说明)  
-5. [当前进度（与报告对齐）](#5-当前进度与报告对齐)  
-6. [双轨路线：神经主干 vs Jetson 边缘版](#6-双轨路线神经主干-vs-jetson-边缘版)  
-7. [系统架构：四层与数据流](#7-系统架构四层与数据流)  
-8. [生命周期、调度与 Jetson 预算](#8-生命周期调度与-jetson-预算)  
-9. [研究问题、基线、Stress Tests 与验证矩阵](#9-研究问题基线stress-tests-与验证矩阵)  
-10. [阶段验收 P0–P4 与交付物](#10-阶段验收-p0p4-与交付物)  
-11. [技术细节：状态、Token 与各层机制](#11-技术细节状态token-与各层机制)  
-12. [实现路线：NUC 原型与 TTT3R 改造](#12-实现路线nuc-原型与-ttt3r-改造)  
-13. [借鉴 Attention、梯度与 LoGeR 的边界](#13-借鉴-attention梯度与-loger-的边界)  
-14. [2026 年 3 月前后相关工作速览](#14-2026-年-3-月前后相关工作速览)  
-15. [参考资料](#15-参考资料)
+相关工作目录：
 
----
+- [cuVSLAM](/home/nyu/Codespace/CVPR/cuVSLAM)
+- [HMR3D](/home/nyu/Codespace/CVPR/HMR3D)
+- 参考前端壳子：[GS_Console](/home/nyu/Codespace/CVPR/GS_Console/README.md)
+- 详细状态文档：[PROJECT_STATUS_AND_REALTIME_GAUSSIAN_PLAN.md](/home/nyu/Codespace/CVPR/PROJECT_STATUS_AND_REALTIME_GAUSSIAN_PLAN.md:1)
+- Jetson GPU backend 环境说明：[JETSON_GPU_BACKEND_SETUP.md](/home/nyu/Codespace/CVPR/HMR3D/docs/JETSON_GPU_BACKEND_SETUP.md:1)
 
-## 1. 核心命题与一句话定位
+## 项目结构
 
-### 1.1 问题意识
+顶层目录当前可以这样理解：
 
-长程在线重建的主要失败模式往往**不是**「backbone 不够大」，而是**记忆如何组织**：
+- [cuVSLAM](/home/nyu/Codespace/CVPR/cuVSLAM)
+  - 原始 SLAM 前端与示例数据入口
+  - 本地 Jetson Python 环境在 [`.venv-jetson`](/home/nyu/Codespace/CVPR/cuVSLAM/.venv-jetson)
+  - 已实际跑通 KITTI 06，并生成轨迹与地图
+- [HMR3D](/home/nyu/Codespace/CVPR/HMR3D)
+  - 记忆生命周期与 Gaussian 实验主仓
+  - `nuc/src/nuc_runtime/` 里是当前核心 runtime
+  - `nuc/scripts/` 里是 replay、benchmark、viewer 生成脚本
+  - `nuc/configs/` 里是各阶段配置
+  - `nuc_output/` 里是实验结果、viewer 页面、render 输出
+- [GS_Console](/home/nyu/Codespace/CVPR/GS_Console)
+  - 只作为展示与 playback 参考，不是当前系统主后端
 
-- **局部高保真**需要近期高分辨率信息；  
-- **长期稳定**需要慢变锚点与可检索历史；  
-- **固定预算**要求主动裁剪与归档；  
-- **重访与回环**要求历史**可恢复**，而不是被均匀遗忘。
+当前最重要的代码文件：
 
-单一 online state 或无限膨胀的全局地图难以同时满足以上四点，因此需要**显式 lifecycle**：**活动区维护、历史区归档、重访时检索与恢复**。
+- Adapter / tracking bridge
+  - [cuvslam_adapter.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/cuvslam_adapter.py:1)
+- Memory lifecycle
+  - [memory_router.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/memory_router.py:1)
+  - [policies.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/policies.py:1)
+  - [models.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/models.py:1)
+  - [config.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/config.py:1)
+- Gaussian system
+  - [gaussian_builder.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/gaussian_builder.py:1)
+  - [gaussian_renderer.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/gaussian_renderer.py:1)
+  - [local_tsdf.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/local_tsdf.py:1)
+- Entry scripts
+  - [run_cuvslam_kitti_memory.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_cuvslam_kitti_memory.py:1)
+  - [run_gaussian_render_benchmark.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_gaussian_render_benchmark.py:1)
+  - [open_gaussian_web.sh](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh:1)
+  - [use_jetson_gpu_backend.sh](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/use_jetson_gpu_backend.sh:1)
 
-### 1.2 神经视角（TTT3R 扩展）
+## 整体架构
 
-> 以 **TTT3R** 的置信驱动在线状态更新为底座，以 **OVGGT** 的常数预算缓存与 anchor 保护为内存控制，以 **MERG3R / 经典 SLAM 子图思想** 为归档与恢复结构，构建面向长序列的**分层记忆**重建系统。
+当前系统不是单层高斯建图，而是三层结构。
 
-答辩式表述：
+### 1. `cuVSLAM`: Tracking / Pose Layer
 
-> 我们不是在 TTT3R 上再加一个语义头，而是把单一在线状态升级成**可写入、可裁剪、可归档、可恢复**的分层记忆系统。
+职责：
 
-### 1.3 边缘视角（HMR3D-GS Lite，见 `edge_gaussian_report`）
+- 提供位姿主链
+- 提供关键帧节奏
+- 提供可复用的 tracking / mapping 前端
+- 对接 Jetson / NVIDIA 生态，适合作为实机底座
 
-> **轻前端（如 cuVSLAM）**保持实时位姿主路径；**HMR3D** 管理 `M_short / M_active / B_bank` 与 **archive / retrieve / recover**；**Gaussian 仅表示当前 active 子图**；历史在 **CPU/NVMe bank**。  
-> 核心命题：**在 Jetson 级预算下，让地图具备可持续的 memory lifecycle，Gaussian 只是活动局部的高质量表达层。**
+这里我们选择 `cuVSLAM`，不是因为它直接让高斯画得更清楚，而是因为：
 
-### 1.4 刻意不强调什么
+- 它更适合 Jetson / Orin Nano
+- tracking 更像实机系统底座
+- 它本身已有 tracking / mapping 解耦与地图复用能力
+- 它让 Gaussian 不用自己硬扛 tracking
 
-- 不把「首次 Gaussian SLAM」当主创新；  
-- 不把语义双状态当 headline（语义可降为辅助：动静态过滤、检索增强、评测）；  
-- 不把门控写成不可解释的大黑盒（优先可解释的重要性与规则组合）。
+### 2. `HMR3D`: Memory Lifecycle Layer
 
----
+职责：
 
-## 2. 文档与报告索引（建议阅读顺序）
+- `observe`
+- `archive`
+- `retrieve`
+- `verify`
+- `recover`
+- `merge`
+- `hierarchy`
 
-| 文档 | 路径 | 内容侧重 |
-|------|------|----------|
-| **边缘系统报告（PDF）** | `latex/edge_gaussian_report.pdf`（源 `latex/edge_gaussian_report.tex`） | Jetson 动机、与手机扫描差异、**HMR3D-GS Lite** 模块图、生命周期公式、**预算表 / 实时性表 / 三线程**、RQ 与基线、stress tests、验证矩阵、P0–P4、风险与 fallback |
-| **统一方法长文（LaTeX）** | `latex/main.tex` | **HMR3D** 命名、TTT3R/VGGT/OVGGT/MERG3R/LoGoPlanner 职责划分、分层记忆数学叙述、评测与实现清单 |
-| **课程 Proposal** | `latex/project_proposal.tex` | 英文叙事与假设陈述 |
-| **可行性长文** | `latex/项目可行性分析与验证.tex` / `latex/feasibility_validation_from_pdf.tex` | 答辩级「像不像拼装」辨析、与 LoGeR 对照叙事 |
-| **NUC 入口** | `NUC_START_HERE.md` → `nuc/README.md` → `docs/NUC_TASKS.md` | CPU 原型阶段任务与验收 |
-| **前端选项** | `docs/TRACKING_FRONTEND_OPTIONS.md` | tracking 与 HMR3D lifecycle 的衔接讨论 |
-| **NUC 架构** | `docs/NUC_ARCHITECTURE.md` | 原型架构说明 |
+这层是本项目最有研究辨识度的部分。  
+很多 streaming GS 工作会做 active window、submap、loop closure，但通常不会把高斯表示组织成这么明确的长期记忆单元。
 
-**README 与报告的关系：** 本文件是**总览与进度源**；细节证明、公式与表格以 **`edge_gaussian_report`** 与 **`main.tex`** 为准。
+这里的核心不是“当前怎么画”，而是：
 
----
+- 哪块 active Gaussian 什么时候该冻结
+- 历史 Gaussian submap 怎样被检索和恢复
+- 旧区域怎样 coarse/full 分层
+- budget 怎样由 memory 状态来驱动
 
-## 3. 仓库结构
+### 3. `Gaussian`: Active Representation Layer
 
-```text
-CVPR/
-  README.md                 # 本文件
-  NUC_START_HERE.md         # NUC 阶段入口
-  latex/                    # 报告与论文草稿（含 edge_gaussian_report）
-  docs/                     # NUC 任务、架构、前端选项等
-  nuc/                      # 无 CUDA 的 memory lifecycle 原型
-  TTT3R/                    # 神经在线重建底座（计划沿此扩展分层记忆）
-  CUT3R/                    # 相关基线代码（按需）
-```
+职责：
 
----
+- 把当前 active submap 表示成局部 Gaussian / surfel-like 结构
+- archive 时导出 Gaussian handle
+- recover 时把历史 Gaussian handle warm-start 回当前 active submap
+- 为当前视角提供可渲染结果
 
-## 4. Git：克隆方式与 main / master 分支说明
+重要的是：
 
-### 4.1 正确克隆
+- `Gaussian` 在这里是 **表示层**
+- `HMR3D` 是 **组织与生命周期层**
+- `cuVSLAM` 是 **位姿与 tracking 层**
 
-远端：`https://github.com/AlanZhu2006/CVPR`
+所以项目主线不是：
 
-- **错误（会 `repository not found`）：**  
-  `git clone https://github.com/AlanZhu2006/CVPR/tree/master`  
-  （浏览器路径，不是 Git URL）
-- **正确：**  
-  `git clone https://github.com/AlanZhu2006/CVPR.git`
+- `cuVSLAM + 一个更清楚的渲染器`
 
-同步默认开发分支：
+而是：
 
-```bash
-git pull origin main
-```
+- `cuVSLAM + HMR3D memory + active Gaussian representation`
 
-### 4.2 `main` 与 `origin/master` 的区别（重要）
+## 当前数据流
 
-- **`main`（本工作区默认）：** 课程与系统向**大仓库**：`nuc/`、`latex/`、内嵌 `TTT3R/`、`docs/` 等，适合报告 + NUC + 后续在 `dust3r` 上改代码。  
-- **`origin/master`：** 与 `main` **并非同一 Git 根历史**（无共同 merge-base），是另一套较小的 **HMR3D 编排树**：围绕 `third_party/TTT3R` 子模块、`hmr3d_memory/`（`MemoryRouter`、`adapter`、几何验证、pose-anchor、Mem3R 实验脚手架等）与评测脚本。  
+当前离线实验主链：
 
-若需阅读或对比 `master` 上的实现，建议：
+`KITTI replay`
+-> `trajectory_tum.txt`
+-> `CUVSLAMOfflineKITTIAdapter`
+-> `TrackingOutput`
+-> `MemoryRouter`
+-> `Active / Archived Submaps`
+-> `Incremental Gaussian Builder`
+-> `Renderer / Viewer`
 
-```bash
-git fetch origin master
-git worktree add ../CVPR-master origin/master
-```
+其中：
 
-**合并两条线**需要显式策略（拣选文件、子树或手动移植），不能假设一次 `merge` 无冲突完成。
+- `Adapter` 把 `cuVSLAM` 轨迹结果变成 HMR3D 可消费的 `TrackingOutput`
+- `MemoryRouter` 决定 submap 生命周期
+- `GaussianBuilder` 把 active submap 变成 Gaussian handle
+- `Renderer` 负责当前视角的验证性渲染
 
----
+## 已完成内容
 
-## 5. 当前进度（与报告对齐）
+### cuVSLAM -> HMR3D 桥接
 
-| 轨道 | 内容 | 状态（截至 2026-04-13） |
-|------|------|-------------------------|
-| **文档** | `edge_gaussian_report`、`main.tex`、可行性文档 | **完整**：命题、模块、评测与风险已写清 |
-| **NUC 原型** | `nuc/`：`observe → promote → archive → retrieve → recover` | **代码骨架就绪**：ORB 类轻前端 + `memory_router`；验收按 `docs/NUC_TASKS.md` Phase 0–6 |
-| **TTT3R 内线改造** | `TTT3R/src/dust3r/` 结构化 state、submap bank、router | **以 Phase 1 为起点**（见第 12 节）；与报告中的模块名一致 |
-| **Jetson + cuVSLAM + Active GS** | HMR3D-GS Lite 全文 | **工程目标**：在 lifecycle 验证后再接，避免先绑死重量级表示 |
-| **远端 `master` 分支** | 状态级 archive/retrieve/recover + 验证管线 | **另一仓库树**：已实现 TTT3R 外接记忆与实验配置；与 `main` 需手动对齐 |
+已完成：
 
-**推荐下一步顺序：** NUC 上跑到 **retrieve / recover 可度量** → **TTT3R 最小 bank + 结构化 state** → 再 **cuVSLAM + active Gaussian**。
+- KITTI 06 轨迹接入 HMR3D runtime
+- 可重复执行的 replay 入口
+- `TrackingOutput` 适配
 
----
+主要入口：
 
-## 6. 双轨路线：神经主干 vs Jetson 边缘版
+- [run_cuvslam_kitti_memory.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_cuvslam_kitti_memory.py:1)
+- [CUVSLAM_ADAPTER.md](/home/nyu/Codespace/CVPR/HMR3D/docs/CUVSLAM_ADAPTER.md:1)
 
-| 维度 | **HMR3D（神经 / TTT3R）** | **HMR3D-GS Lite（边缘报告）** |
-|------|---------------------------|--------------------------------|
-| 前端 | 序列帧 + 模型内 pose/几何 | **cuVSLAM** 实时位姿与事件信号 |
-| 活动表示 | `state_feat` / `state_pos` / `mem` 等 | **Active Gaussian submap**（仅当前区域） |
-| 归档 | 子图摘要、descriptor、anchors（设计） | **CPU/NVMe bank**，冻结子图包 |
-| 创新叙事 | 分层 token + TTT3R/OVGGT/MERG3R | **Edge-oriented map lifecycle** + 预算内生存 |
+### HMR3D 生命周期机制
 
-两轨共享同一内核：**显式 archive / retrieve / recover**，不把长程责任压给单一状态或无限全局地图。
+已落地并验证的机制包括：
 
----
+- write-aware archive policy
+- anchor retention
+- pose-anchor gate
+- shadow recover
+- hierarchical bank
+- scene-level summaries
+- query routing
+- multi-candidate merge
+- local adapt
 
-## 7. 系统架构：四层与数据流
+### Incremental Gaussian
 
-系统命名为 **HMR3D**，由四层组成（对应四类 **token 维护职责**，而非泛泛模块分工）：
+已完成：
 
-1. **短程层 `M_short`** — 「看清楚」：最近窗口高保真、query-based 聚合（LoGoPlanner 思想进短程，不进长程地图主体）。  
-2. **活动层 `M_active`** — 「记得住」：当前区域 persistent 状态；对齐 **TTT3R** 的 `state_feat/state_pos/mem` 并扩展锚点/上下文双速率等。  
-3. **归档层 `B_bank`** — 「存得下、找得回」：子图摘要、descriptor、anchors；对齐 **MERG3R/SLAM 子图** 思想。  
-4. **调度层 `Router`** — 写入 / 晋升 / 裁剪 / 归档 / 恢复；组合 **TTT3R 置信写回** 与 **OVGGT 式重要性 + anchor 保护**，避免单一大 gate。
+- active Gaussian submap 增量更新
+- archived Gaussian handle 导出
+- recover 时 warm-start 历史 Gaussian
+- PLY / NPZ 导出
+- live replay 与 web viewer
 
-```text
-输入帧流 x_t
-    → M_short（局部工作区）
-    → 候选 Delta_t、对齐置信、重要性、重访描述子 d_t
-    → Router
-         ├→ M_active（活动地图）
-         └→ B_bank（归档库） ⟵ retrieve / recover
-    → 输出：深度/点云/位姿/地图状态
-```
+### Viewer / Demo
 
-**边缘版补充（报告图）：** `Stereo/RGB-D/IMU → cuVSLAM → HMR3D Memory Router → (M_short, M_active GS, B_bank) → 可选 mesh shadow**。
+当前已有三类查看方式：
 
----
+- `Rerun` 3D viewer
+- `GT / Render / Diff` triplet viewer
+- `GS_Console` 风格 compare viewer
 
-## 8. 生命周期、调度与 Jetson 预算
+当前代表性页面：
 
-### 8.1 生命周期（与报告一致）
+- Rerun 录制：[kitti06_v4_gaussian_live_800.rrd](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_v4_gaussian_live_800.rrd:1)
+- triplet 页面：[render_triplets_viewer.html](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_v7_semantic_mask/render_triplets_viewer.html:1)
+- compare 页面：[gsconsole_compare_viewer.html](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_v7_semantic_mask/gsconsole_compare_viewer.html:1)
+- 三路对比：[gaussian_triple_compare_semantic.html](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/gaussian_triple_compare_semantic.html:1)
 
-典型事件链：**observe → promote → archive → retrieve → recover**（必要时轻量 merge / refine）。
+### Jetson GPU backend 环境
 
-- **归档触发（概念）：** 预算压力、与当前区域 overlap 下降、活动片段年龄、场景切换或回环边界事件等。  
-- **检索：** 描述子 top-k **不等于**直接闭环；需 **几何验证** 降低假阳性。  
-- **恢复：** 通常**部分注入**（anchors + summary + 必要局部表示），再经**短窗 refine**，而非整库灌回 GPU。
+当前 Orin Nano 已经打通：
 
-### 8.2 调度原则（报告原意）
+- `torch 2.8.0`
+- `torchvision 0.23.0`
+- `torchaudio 2.8.0`
+- `gsplat 1.5.3`
+- `torch.cuda.is_available() == True`
 
-> **Tracking 是实时主线；memory 与 active map 更新只能消费 tracking 剩余预算，不得反向阻塞 tracking。**
+验证脚本：
 
-因此：archive/retrieve/recover 为 **事件驱动**；active 高斯或神经更新放在 **keyframe 级 / 低频线程**。
+- [use_jetson_gpu_backend.sh](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/use_jetson_gpu_backend.sh:1)
 
-### 8.3 分层实时性（摘自报告思想）
+说明文档：
 
-| 层级 | 目标频率量级 | 说明 |
-|------|----------------|------|
-| tracking | ~20–30 Hz | 位姿主路径 |
-| keyframe | ~5–10 Hz | 建图不必每帧 |
-| active map 更新 | ~1–5 Hz | 关键帧级即可 |
-| archive / recover | 事件触发 | 场景切换、重访、歧义 |
+- [JETSON_GPU_BACKEND_SETUP.md](/home/nyu/Codespace/CVPR/HMR3D/docs/JETSON_GPU_BACKEND_SETUP.md:1)
 
-### 8.4 Jetson 预算分层（报告表意）
+## `v1` 到 `v7` 分阶段演进
 
-- **cuVSLAM：** 最高优先级，避免被高斯优化拖死。  
-- **active Gaussian：** GPU 常驻但**容量有上限**，局部更新与渲染。  
-- **bank：** CPU/NVMe，可增长但条目需压缩与索引。  
-- **可选全局 mesh/TSDF：** 稳定支撑，不必与高斯同频。
+下面这 7 个阶段不是“七篇不同论文式方法”，而是当前这条实验线的 7 次关键演进。
 
-### 8.5 三线程模型（报告建议）
+### `v1`: Baseline Memory + Minimal Render
 
-1. **实时主线程：** tracking、关键帧、loop signal。  
-2. **记忆路由线程：** promote、预算、archive/retrieve 触发。  
-3. **低频建图线程：** active 更新、recover 注入、局部 merge。
+做了什么：
 
-成本直觉（报告中的分层）：只有 tracking 是每帧硬约束；其余项带事件指示函数，可按 keyframe / 事件开关。
+- 打通 `cuVSLAM -> HMR3D`
+- 建立 baseline lifecycle
+- 提供最小 render benchmark 回路
 
----
+意义：
 
-## 9. 研究问题、基线、Stress Tests 与验证矩阵
+- 从“只有轨迹”推进到“能跑 memory system”
 
-### 9.1 三个核心研究问题（RQ，来自 `edge_gaussian_report`）
+### `v2`: Write-aware / Recover-aware Memory
 
-1. **RQ1：** 固定显存下，**active/archive 解耦**是否优于单一膨胀活动地图？  
-2. **RQ2：** **retrieve/recover** 是否降低 long-gap revisit 与 branch confusion 失败率？  
-3. **RQ3：** 在 Jetson 上，**仅 active Gaussian submap** 是否在可接受实时性下优于 mesh-only 的局部质量或可查询性？
+做了什么：
 
-### 9.2 建议基线（报告）
+- write-aware archive policy
+- anchor retention
+- pose-anchor gate
+- shadow recover
 
-1. Tracking + mesh（如 cuVSLAM + nvblox），无长期 archive/recover。  
-2. 无 archive 的 **active GS 滑窗**。  
-3. 有 archive 但 **无 retrieve**（只压缩）。  
-4. **完整系统**：active GS + bank + retrieve/recover。
+意义：
 
-### 9.3 Stress Tests（报告 + `main.tex` 一致方向）
+- 解决 archive 过碎
+- 让 recover 更克制、更可信
 
-1. **Horizon Scaling** — 随序列长度误差与延迟退化。  
-2. **Branch Disambiguation** — 重复结构身份混淆。  
-3. **Forced Backtracking** — 远离再返回是否仍能利用历史。  
-4. **Revisit Recovery** — retrieve/recover 后误差是否真下降。
+### `v3`: Full HMR3D Memory Lifecycle
 
-### 9.4 验证矩阵与成功档次（报告）
+做了什么：
 
-验证需分层：**记忆假设 / 表示假设 / 部署假设**。报告给出「正向证据 vs 若不成立的信号」表（memory lifecycle、retrieve/recover、active GS、Jetson 在线触发）。
+- hierarchical bank
+- scene summary
+- query routing
+- multi-candidate merge
+- local adapt
 
-**结果分档简述：**
+意义：
 
-- **完整成功：** Jetson（或 Orin 级）全链路 + 固定预算下相对基线显著改善。  
-- **部分成功：** 桌面侧证实 lifecycle 收益 + Jetson 最小展示证明在线触发。  
-- **负结果仍有价值：** 若 GS 不划算但 lifecycle 有效，则叙事收缩为「边缘长程关键在记忆组织，不必绑定 Gaussian」。
+- HMR3D 从简单 bank 变成显式长期记忆层
 
----
+### `v4`: Incremental Gaussian + Realtime Budget 线
 
-## 10. 阶段验收 P0–P4 与交付物
+做了什么：
 
-### 10.1 分层验收（报告）
+- active Gaussian submap
+- archive Gaussian handle
+- recover Gaussian warm-start
+- live Rerun / web viewer
+- realtime budget scheduler
+- unstable mask / coarse archived bank / view-aware budget
 
-- **P0/P1：** 数据流、关键帧、`M_short/M_active/B_bank` 与 **archive/retrieve/recover 路由**跑通（active 可为 mesh-only 或占位）。  
-- **P2：** active Gaussian patch 可局部更新与渲染，**不拖垮** tracking。  
-- **P3/P4：** 固定预算下，在 revisit、branch、backtracking 等 stress 上相对 **no-archive / no-retrieve** 基线有可测收益。
+代表结果：
 
-### 10.2 阶段划分（报告）
+- [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_realtime_budget/render_benchmark_summary.json:1)
 
-- **P0：** 稳定基线与数据流。  
-- **P1：** HMR3D 生命周期。  
-- **P2：** Active Gaussian（仅活动区）。  
-- **P3：** Jetson 裁剪与固定容量。  
-- **P4：** 重访恢复与系统对比实验。
+关键指标：
 
-### 10.3 每阶段证据（报告）
+- `PSNR 13.1584`
+- `SSIM 0.45105`
+- `update 265.91 ms`
+- `render 748.4 ms`
+- `approx_fps 0.986`
 
-每阶段应有可复核产出：tracking 频率与资源表、bank 样例与日志、局部渲染或更新样例、budget 曲线、stress test 图表等。
+### `v5`: 更强几何 + 质量向尝试
 
-### 10.4 建议最终交付物
+做了什么：
 
-桌面可运行原型、Jetson 最小展示、以 horizon/branch/revisit 为核心的实验、以及**明确区分**「多少增益来自 lifecycle、多少来自 Gaussian 表示」的报告叙述。
+- 更稳定的 stereo / surfel 输入
+- 更偏质量向的配置
+- 尝试靠更强几何与优化改善画面
 
----
+代表结果：
 
-## 11. 技术细节：状态、Token 与各层机制
+- [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_v5_quality_tuned/render_benchmark_summary.json:1)
 
-### 11.1 总状态
+作用：
 
-```text
-S_t = { M_short^t, M_active^t, B_bank^t }
-```
+- 验证“继续堆质量向模块”并没有自然把系统推到 GS-SDF 水平
 
-当前帧输出包括但不限于：`Delta_t`、`c_align^t`、`s_import^t`、重访描述子 `d_t`、各类 query token（`q_pose`、`q_geo`、`q_desc`、`q_sum`）。
+### `v6`: Local Surface Volume / Thin Surface
 
-### 11.2 Token 类型（五类）
+做了什么：
 
-| 类型 | 符号 | 角色 |
-|------|------|------|
-| 观测 | `P_t` | 噪声大、寿命最短，主要停短程 |
-| 局部锚点 | `A_t` | 稳定、可晋升至活动层 |
-| 活动状态 | `H_t` | 对应 TTT3R 状态扩展 |
-| 归档摘要 | `Z_j` | 子图级压缩 |
-| 查询 | `Q` | 从记忆中读出任务相关摘要 |
+- local surface volume / local TSDF-like 几何底座
+- near-visible surface
+- confidence pruning
+- thin surface extraction
+- bad depth block suppression
 
-**要点：** 短程与长程不「全员混更新」，而是由 **query 读出**再决定 promote/archive/recover。
+代表结果：
 
-### 11.3 短程层
+- [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_v6_thin_surface/render_benchmark_summary.json:1)
 
-```text
-M_short^t = { L_recent^t, A_short^t, Q_short }
-```
+关键指标：
 
-聚合形式（示意）：
+- `PSNR 13.0304`
+- `SSIM 0.36866`
+- `update 1142.968 ms`
+- `render 2196.215 ms`
+- `approx_fps 0.299`
 
-```text
-P_t = Enc(x_t, r_t, pi_t)
-z_pose^t = Attn(q_pose, L_recent ∪ A_short)
-z_geo^t  = Attn(q_geo,  L_recent ∪ A_short)
-d_t      = Proj(Attn(q_desc, L_recent ∪ A_short))
-```
+意义：
 
-晋升：`m_promote(i) = 1[s_import(i) > τ_s ∧ support(i) > τ_k]`。
+- 方向更接近 `GSFusion / Gaussian-SLAM` 的局部几何思路
+- 但也明确暴露出：再往重几何走，会离“实时高斯前端”越来越远
 
-### 11.4 活动层（双速率）
+### `v7`: Semantic-like Region Filter
 
-```text
-M_active^t = { A_active^t, C_active^t }
-```
+做了什么：
 
-- 锚点慢更新、上下文快更新；写回强度乘 **TTT3R 式** `c_align`。  
-- 摘要：`S_active^t = Attn(q_sum, A_active ∪ C_active)`，服务后续归档。
+- 轻量规则版 semantic-like mask
+- 剔除天空、超远低价值区域、低置信和不稳定块
+- 让系统更像“实时前端 budget 控制器”，而不是更重的后端
 
-### 11.5 内存控制（OVGGT 思想）
+代表结果：
 
-重要性可组合 residual、attention、几何锚、置信、**revisit** 等；动作为 `keep / promote / archive / evict`；**anchor 保护**后再裁剪。
+- [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_v7_semantic_mask/render_benchmark_summary.json:1)
 
-### 11.6 归档包（MERG3R/SLAM 思想）
+关键指标：
 
-```text
-B_j = { desc_j, latent_j, anchors_j, pose_j, conf_j, meta_j }
-U_j = { S_active^j, A_active^j, T_j } → latent_j = Pool_Q(q_sum, U_j)
-```
+- `PSNR 12.6755`
+- `SSIM 0.35835`
+- `update 1095.143 ms`
+- `render 1946.152 ms`
+- `approx_fps 0.329`
 
-恢复后流程：**retrieve → 注入 M_active → 短程 refine**。
+意义：
 
-### 11.7 语义（若保留）
+- 更符合“实时高斯前端”方向
+- 但质量仍然没有接近 GS-SDF
 
-仅作辅助：动静态过滤、检索增强、长期一致性评测；**不作 headline**。
+## 目前已经测试过什么
 
----
+当前已经做过的验证，可以分成 5 类：
 
-## 12. 实现路线：NUC 原型与 TTT3R 改造
+### 1. Lifecycle 验证
 
-### 12.1 NUC 阶段（CPU，无 CUDA）
+验证：
 
-- **入口：** `NUC_START_HERE.md`、`nuc/README.md`  
-- **任务与验收：** `docs/NUC_TASKS.md`（Phase 0–6：环境 → tracking → Router → archive → retrieve → recover → 对照实验）  
-- **一键收口：** `bash nuc/scripts/close_phase6.sh`  
-- **模块：** `nuc/src/nuc_runtime/tracking.py`、`memory_router.py`、`descriptors.py`、`io.py`、`output.py`
+- active/archive 切换
+- retrieve / recover 是否触发
+- hierarchical bank 是否形成
+- merge / local adapt 是否实际发生
 
-**边界：** NUC tracking 为**占位前端**；价值在 **lifecycle 逻辑与日志可验收**，不是最终 SLAM 精度。
+### 2. Gaussian 生成与导出
 
-### 12.2 TTT3R 改造（`CVPR/TTT3R/`）
+验证：
 
-建议顺序（与旧版路线图一致，浓缩）：
+- active Gaussian 是否逐帧增长
+- archived Gaussian handle 是否落盘
+- warm-start recover 是否能够重新挂回当前 active submap
 
-1. **`demo.py`**：增加 `--memory_budget`、`--short_window`、`--enable_submap_bank` 等参数。  
-2. **`inference.py`**：将 `state_args` 提升为结构化对象（dict/dataclass）。  
-3. **`model.py`**：`forward_recurrent_lighter` 等路径上输出 importance、anchor mask；写回前 keep/evict；段末导出子图摘要。  
-4. **新文件（建议）：** `hier_state.py`、`submap_bank.py`、`revisit.py`、`memory_router.py`（与 NUC 概念对齐，便于以后统一接口）。
+### 3. 当前视角渲染
 
-### 12.3 评测扩展
+验证：
 
-在 ATE/RPE/深度外，增加：重访命中率、恢复前后误差变化、bank 压缩比、峰值显存、延迟、每百帧漂移等。
+- 能否输出 `GT / Render / Diff`
+- 渲染是否至少有连续视角感
+- 画质和延迟的权衡
 
----
+### 4. 不同策略对比
 
-## 13. 借鉴 Attention、梯度与 LoGeR 的边界
+已对比：
 
-**原则：借机制，不整套换架构。**
+- quality-oriented surfel
+- realtime budget
+- semantic-like mask
 
-- **Attention 适合：** archive **保留决策**、retrieve **读 bank**、recover **部分注入**（小规模 Q/K/V，避免全历史 global attention）。  
-- **梯度 / TTT 式适应适合：** **active 局部**少量步 refine、recover 后对齐、descriptor/summary 的**极轻量**修正；配合**置信度调学习率**。  
-- **不建议：** 全序列 Transformer 式历史 attention；把整个 bank 压成单一 fast-weight 隐状态（损害可归档、可检索、可控预算）。  
-- **LoGeR：** 作**长序列混合记忆**的对标与思想参考（仓库外或本地 `LoGeR/` 可参考），**不作为**主线工程依赖；主线保持 **显式 bank + lifecycle**。
+三路对比入口：
 
-论文式表述：
+- [gaussian_triple_compare_semantic.html](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/gaussian_triple_compare_semantic.html:1)
 
-> 在显式 memory lifecycle 下引入轻量 **attention 式 readout/筛选** 与 **置信度感知局部 refine**，提升 archive/retrieve/recover；**主干贡献仍为分层记忆与生命周期**，而非通用 Transformer 或端到端 TTT 记忆替代 bank。
+### 5. Jetson GPU backend
 
----
+验证：
 
-## 14. 2026 年 3 月前后相关工作速览
+- `.venv-jetson` 下 GPU `torch` 可用
+- `gsplat` 可导入
+- Orin Nano 当前可作为成熟 GPU backend 目标环境
 
-| 工作 | 要点 | 在本项目中的用法 |
-|------|------|------------------|
-| [OVGGT](https://arxiv.org/abs/2603.05959) | 常数成本缓存、anchor 保护 | 预算与重要性筛选 |
-| [MERG3R](https://arxiv.org/abs/2603.02351) | 分治、子图、对齐 | 归档/恢复/合并**结构**参考，非一上来全量 BA |
-| [TTT3R](https://arxiv.org/abs/2509.26645) | 对齐置信 → 更新率 | **活动层**主写入规则 |
-| [StreamVGGT / 4D VGGT](https://arxiv.org/abs/2507.11539) | 因果局部高质量 | **短程层**候选，不承担无限长程记忆 |
-| [LoGeR](https://arxiv.org/abs/2603.03269) | 长上下文混合记忆 | **对照组与思想**，非模块拼装核心 |
-| [CUT3R](https://arxiv.org/abs/2501.12387) | 持续状态基线 | 对比与实现参考 |
-| [VGGT](https://arxiv.org/abs/2503.11651) | 强几何 backbone | 局部/离线增强可选 |
+## 当前结论
 
----
+现在最重要的判断，不是“我们还差几个 heuristic”，而是：
 
-## 15. 参考资料
+### 1. 轻量原型线已经试得比较全了
 
-### 15.1 论文与项目链接
+当前已经综合过：
 
-- [OVGGT](https://arxiv.org/abs/2603.05959)  
-- [MERG3R](https://arxiv.org/abs/2603.02351)  
-- [TTT3R](https://arxiv.org/abs/2509.26645)  
-- [LoGeR](https://arxiv.org/abs/2603.03269)  
-- [Streaming 4D Visual Geometry Transformer](https://arxiv.org/abs/2507.11539)  
-- [CUT3R](https://arxiv.org/abs/2501.12387)  
-- [VGGT](https://arxiv.org/abs/2503.11651)  
-- [TTT3R 代码](https://github.com/Inception3D/TTT3R)  
-- [CUT3R 代码](https://github.com/CUT3R/CUT3R)  
-- [cuVSLAM](https://github.com/nvidia-isaac/cuVSLAM)  
-- [Isaac ROS Visual SLAM](https://nvidia-isaac-ros.github.io/repositories_and_packages/isaac_ros_visual_slam/index.html)  
-- [Isaac ROS nvblox](https://nvidia-isaac-ros.github.io/repositories_and_packages/isaac_ros_nvblox/index.html)  
-- [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)  
-- [gsplat](https://github.com/nerfstudio-project/gsplat)  
+- stereo seed
+- surfel patch
+- local optimization
+- unstable mask
+- hierarchical gaussian bank
+- view-aware budget
+- local surface volume
+- thin surface extraction
+- semantic-like region filter
 
-### 15.2 最终对外叙事建议
+所以现在不是“还没综合”，而是：
 
-优先使用：
+> 该综合的轻量策略已经做过一轮了。
 
-- **分层记忆长程在线三维重建**  
-- **SLAM 启发的子图归档与重访恢复**  
-- **预算受限的神经/混合几何记忆系统**
+### 2. 当前画质还明显不如成熟 streaming GS
 
-避免把项目讲成「又一个语义 SLAM」或「仅换 backbone」。
+这不是页面问题，而是底层问题：
 
----
+- depth 质量还不够强
+- Gaussian 参数还是简化版
+- renderer 还是近似版
 
-*本 README 将 `latex/edge_gaussian_report` 与神经路线 `latex/main.tex` 对齐为单一进度叙事；细节公式、证明与完整表格以对应 TeX/PDF 为准。*
+### 3. 真正的研究辨识度在 `HMR3D memory-native Gaussian`
+
+当前最值得强调的不是：
+
+- “我们能不能把图再磨清楚一点”
+
+而是：
+
+- “我们能不能把 Gaussian 真正纳入一个显式长期记忆系统”
+
+也就是：
+
+- Gaussian archive
+- Gaussian retrieve
+- Gaussian recover
+- coarse/full hierarchy
+- memory-aware budget scheduling
+
+这部分相比许多只做 local rendering / local mapping 的 streaming GS，更像本项目真正的创新点。
+
+## 下一步计划
+
+当前最合理的下一步，不建议再继续无休止地往同一条轻量 CPU renderer 线上堆模块，而是分成两条更清楚的路线。
+
+### 路线 A：Realtime Frontend Mode
+
+目标：
+
+- 继续坚持“实时高斯前端”
+- 不追求 GS-SDF 级别视觉上限
+- 优先保证：
+  - tracking 稳
+  - active Gaussian 能持续长
+  - budget 能收住
+  - recover / archive / hierarchy 可用
+
+重点应该做：
+
+- 把 `semantic-like mask + unstable mask + view-aware budget` 真正联动
+- 只保留静态、近处、结构性强的区域
+- 显式限制 active Gaussian 数量
+- 明确 `realtime_frontend` 配置
+
+### 路线 B：Quality Upper Bound Mode
+
+目标：
+
+- 不再强求实时
+- 看在更强 backend 下，这条 `cuVSLAM + HMR3D + Gaussian` 能达到怎样的质量上限
+
+重点应该做：
+
+- 增加 GPU backend adapter
+- 接入 `gsplat` 作为可选 backend
+- 不改 HMR3D lifecycle 主逻辑，只替换底层 renderer/backend
+
+### 当前推荐主线
+
+就研究辨识度和系统路线来说，当前更推荐把主线收束成：
+
+1. `cuVSLAM` 继续做前端 tracking
+2. `HMR3D` 明确做长期记忆层
+3. `Gaussian` 做 active / recovered region 的表示层
+4. `gsplat` 作为后续可切换 backend，而不是替代 HMR3D 主线
+
+一句话说：
+
+> 后续最该做的不是“再做一个更像 GS-SDF 的独立 renderer”，而是把当前系统推进成一个真正的 `memory-native Gaussian system`，再让成熟 GPU backend 为它服务。
+
+## 实机落地建议
+
+后续如果上实机，建议分阶段推进：
+
+### Phase A: 只上 tracking
+
+- 先在 Jetson 上稳定跑 `cuVSLAM`
+- 拿到实时 pose / keyframe / tracking status
+
+### Phase B: 上 HMR3D memory
+
+- 把 live `TrackingOutput` 喂给 `MemoryRouter`
+- 验证 archive / retrieve / recover 是否在真实数据上触发
+
+### Phase C: 上 active Gaussian
+
+- 只在当前 active submap 维护高斯
+- 暂时不追求全局高质量重建
+
+### Phase D: 接成熟 GPU backend
+
+- 用当前已经打通的 Jetson GPU Python 环境
+- 给 HMR3D 增加 backend adapter
+- 在不改变 memory lifecycle 的前提下切换到 `gsplat`
+
+## 当前最重要的文档与入口
+
+- 顶层状态说明：
+  - [PROJECT_STATUS_AND_REALTIME_GAUSSIAN_PLAN.md](/home/nyu/Codespace/CVPR/PROJECT_STATUS_AND_REALTIME_GAUSSIAN_PLAN.md:1)
+- Jetson GPU backend：
+  - [JETSON_GPU_BACKEND_SETUP.md](/home/nyu/Codespace/CVPR/HMR3D/docs/JETSON_GPU_BACKEND_SETUP.md:1)
+  - [use_jetson_gpu_backend.sh](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/use_jetson_gpu_backend.sh:1)
+- HMR3D / cuVSLAM bridge：
+  - [CUVSLAM_ADAPTER.md](/home/nyu/Codespace/CVPR/HMR3D/docs/CUVSLAM_ADAPTER.md:1)
+- 当前三路渲染对比：
+  - [gaussian_triple_compare_semantic.html](/home/nyu/Codespace/CVPR/HMR3D/nuc_output/gaussian_triple_compare_semantic.html:1)

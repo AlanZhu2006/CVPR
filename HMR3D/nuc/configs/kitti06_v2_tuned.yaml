@@ -1,0 +1,30 @@
+input:
+  frame_step: 5
+  max_frames: 400
+
+memory:
+  short_window_size: 20
+  active_max_keyframes: 12
+  active_max_age: 120
+  active_max_distance: 2.5
+  active_similarity_floor: 0.72
+  archive_min_keyframes: 3
+  archive_min_mean_match_count: 100.0
+  archive_min_mean_descriptor_score: 0.78
+  anchor_topk: 3
+  retrieve_topk: 3
+  retrieve_similarity_threshold: 0.82
+  retrieve_cooldown_frames: 20
+  geo_verify_min_matches: 25
+  enable_recover: true
+  enable_v2_write_policy: true
+  enable_pose_anchor_gate: true
+  pose_anchor_translation_threshold: 20.0
+  pose_anchor_rotation_threshold_deg: 15.0
+  enable_shadow_recover: true
+  shadow_promote_min_matches: 30
+  shadow_similarity_threshold: 0.88
+
+output:
+  output_dir: /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_v2_tuned
+

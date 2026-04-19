@@ -1,0 +1,11 @@
+build
+.vscode
+.nvcode*
+*.pyc
+.idea
+.env
+.venv
+.cache
+__pycache__
+*.egg-info
+dataset

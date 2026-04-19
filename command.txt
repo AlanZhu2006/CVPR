@@ -1,0 +1,46 @@
+/home/nyu/Codespace/CVPR/cuVSLAM/.venv-jetson/bin/rerun \
+  /home/nyu/Codespace/CVPR/cuVSLAM/outputs/orin_nano_demo/synthetic_slam.rrd
+
+/home/nyu/Codespace/CVPR/cuVSLAM/.venv-jetson/bin/rerun \
+  /home/nyu/Codespace/CVPR/cuVSLAM/outputs/kitti/track_kitti_slam_seq06_full.rrd
+
+cd /home/nyu/Codespace/CVPR/cuVSLAM
+CUVSLAM_RERUN_MODE=save \
+  .venv-jetson/bin/python examples/kitti/track_kitti_slam.py \
+  --force-remap \
+  --rerun-file outputs/kitti/track_kitti_slam_seq06_full.rrd
+
+
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_v4_gaussian_live_800_viewer.html \
+  9090
+
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_v4_gaussian_live_800_viewer.html \
+  9090
+
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_surfel_denseviewer/render_triplets_viewer.html \
+  19090
+
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_vnext/gsconsole_compare_viewer.html \
+  19090
+
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_realtime_budget/gsconsole_compare_viewer.html \
+  19090
+
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/gaussian_triple_compare_semantic.html \
+  19090
+
+ssh -L 19090:127.0.0.1:19090 nyu@nuc-6913-frp
+
+http://127.0.0.1:19090/render_triplets_viewer.html
+
+http://127.0.0.1:9090/kitti06_v4_gaussian_live_800_viewer.html
+
+http://127.0.0.1:19090/gsconsole_compare_viewer.html
+
+source /home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/use_jetson_gpu_backend.sh

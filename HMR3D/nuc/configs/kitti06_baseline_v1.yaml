@@ -1,0 +1,22 @@
+input:
+  frame_step: 5
+  max_frames: 400
+
+memory:
+  short_window_size: 20
+  active_max_keyframes: 12
+  active_max_age: 120
+  active_max_distance: 2.5
+  active_similarity_floor: 0.72
+  retrieve_topk: 3
+  retrieve_similarity_threshold: 0.82
+  retrieve_cooldown_frames: 20
+  geo_verify_min_matches: 25
+  enable_recover: true
+  enable_v2_write_policy: false
+  enable_pose_anchor_gate: false
+  enable_shadow_recover: false
+
+output:
+  output_dir: /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_baseline_v1
+
