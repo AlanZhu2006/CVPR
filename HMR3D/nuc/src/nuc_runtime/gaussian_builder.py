@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ import numpy as np
 from nuc_runtime.config import MemoryConfig
 from nuc_runtime.local_tsdf import LocalSurfaceVolume
 from nuc_runtime.models import KeyframeRecord
+from nuc_runtime.sky_mask import StreamingSkyMask
 
 
 @dataclass
@@ -20,6 +22,7 @@ class IncrementalGaussianState:
     stereo_updates: int = 0
     point_count: int = 0
     recovered_seed_points: int = 0
+    recover_refine_frames_left: int = 0
     optimize_steps: int = 0
     last_keyframe: KeyframeRecord | None = None
     xyz: list[np.ndarray] = field(default_factory=list)
@@ -92,6 +95,7 @@ class IncrementalGaussianBuilder:
         self._stereo_cache: dict[Path, tuple[np.ndarray, float]] = {}
         self._handle_cache: dict[str, dict[str, np.ndarray]] = {}
         self._local_volumes: dict[int, LocalSurfaceVolume] = {}
+        self._sky_mask = StreamingSkyMask(config)
 
     def start_submap(self, submap_id: int) -> IncrementalGaussianState:
         state = IncrementalGaussianState(submap_id=submap_id)
@@ -107,6 +111,7 @@ class IncrementalGaussianBuilder:
 
         state.keyframe_count += 1
         stereo_info = self._get_stereo_depth_info(keyframe)
+        should_append = self._should_append_stream_keyframe(state, keyframe)
         self._update_local_surface_volume(submap_id, keyframe, stereo_info)
         if state.last_keyframe is None:
             stereo_xyz, stereo_rgb, stereo_scale, stereo_opacity, stereo_axis_u, stereo_axis_v = self._triangulate_stereo_keyframe(keyframe)
@@ -125,7 +130,16 @@ class IncrementalGaussianBuilder:
                 )
                 state.stereo_updates += 1
             state.last_keyframe = keyframe
-            return self._state_summary(state)
+            summary = self._state_summary(state)
+            summary["stream_append"] = True
+            return summary
+
+        if not should_append:
+            state.last_keyframe = keyframe
+            summary = self._state_summary(state)
+            summary["stream_append"] = False
+            summary["stream_skipped"] = True
+            return summary
 
         new_xyz, new_rgb, new_scale, new_opacity, new_axis_u, new_axis_v = self._triangulate_pair(state.last_keyframe, keyframe)
         if new_xyz.size > 0:
@@ -157,7 +171,9 @@ class IncrementalGaussianBuilder:
             )
             state.stereo_updates += 1
         state.last_keyframe = keyframe
-        return self._state_summary(state)
+        summary = self._state_summary(state)
+        summary["stream_append"] = True
+        return summary
 
     def _fuse_points_into_state(
         self,
@@ -269,6 +285,11 @@ class IncrementalGaussianBuilder:
             state.append_points(xyz, rgb, scale, opacity, axis_u, axis_v, unstable, recentness, source)
             total_added += int(limit)
         state.recovered_seed_points += total_added
+        if total_added > 0:
+            state.recover_refine_frames_left = max(
+                state.recover_refine_frames_left,
+                int(self.config.gaussian_optimize_recover_refine_frames),
+            )
         summary = self._state_summary(state)
         summary["last_seed_points_added"] = total_added
         return summary
@@ -359,6 +380,163 @@ class IncrementalGaussianBuilder:
         self._local_volumes.pop(submap_id, None)
         return handle
 
+    def export_lingbot_predictions_as_handle(
+        self,
+        submap_id: int,
+        predictions_npz: str | Path,
+        summary_json: str | Path,
+        reason: str = "lingbot_structured_init",
+    ) -> dict[str, Any] | None:
+        predictions_npz = Path(predictions_npz).expanduser().resolve()
+        summary_json = Path(summary_json).expanduser().resolve()
+        if not predictions_npz.exists():
+            raise FileNotFoundError(f"Missing LingBot predictions: {predictions_npz}")
+        if not summary_json.exists():
+            raise FileNotFoundError(f"Missing LingBot summary: {summary_json}")
+
+        summary = json.loads(summary_json.read_text(encoding="utf-8"))
+        bundle = np.load(predictions_npz)
+        gaussian_bundle = self._lingbot_predictions_to_gaussian_bundle(
+            bundle=bundle,
+            image_paths=summary.get("image_paths", []),
+            summary=summary,
+        )
+
+        submap_dir = self.output_dir / f"lingbot_submap_{submap_id:04d}"
+        submap_dir.mkdir(parents=True, exist_ok=True)
+        if gaussian_bundle["xyz"].size == 0:
+            handle = {
+                "submap_id": submap_id,
+                "reason": reason,
+                "point_count": 0,
+                "pair_updates": 0,
+                "keyframe_count": int(summary.get("frame_count", 0)),
+                "ply_path": "",
+                "npz_path": "",
+                "coarse_ply_path": "",
+                "coarse_npz_path": "",
+                "coarse_point_count": 0,
+                "recovered_seed_points": 0,
+                "lingbot_source": str(predictions_npz),
+            }
+            return handle
+
+        npz_path = submap_dir / "gaussians.npz"
+        ply_path = submap_dir / "gaussians.ply"
+        np.savez_compressed(npz_path, **gaussian_bundle)
+        self._write_ply(
+            ply_path,
+            gaussian_bundle["xyz"],
+            gaussian_bundle["rgb"],
+            gaussian_bundle["scale"],
+            gaussian_bundle["opacity"],
+            gaussian_bundle["axis_u"],
+            gaussian_bundle["axis_v"],
+        )
+        coarse = self._build_coarse_bundle(**gaussian_bundle)
+        coarse_npz_path = submap_dir / "gaussians_coarse.npz"
+        coarse_ply_path = submap_dir / "gaussians_coarse.ply"
+        np.savez_compressed(coarse_npz_path, **coarse)
+        self._write_ply(
+            coarse_ply_path,
+            coarse["xyz"],
+            coarse["rgb"],
+            coarse["scale"],
+            coarse["opacity"],
+            coarse["axis_u"],
+            coarse["axis_v"],
+        )
+        handle = {
+            "submap_id": submap_id,
+            "reason": reason,
+            "point_count": int(gaussian_bundle["xyz"].shape[0]),
+            "pair_updates": 0,
+            "keyframe_count": int(summary.get("frame_count", 0)),
+            "ply_path": str(ply_path),
+            "npz_path": str(npz_path),
+            "coarse_ply_path": str(coarse_ply_path),
+            "coarse_npz_path": str(coarse_npz_path),
+            "coarse_point_count": int(coarse["xyz"].shape[0]),
+            "recovered_seed_points": 0,
+            "lingbot_source": str(predictions_npz),
+        }
+        return handle
+
+    def export_lingbot_dense_geometry_as_handle(
+        self,
+        submap_id: int,
+        dense_geometry_npz: str | Path,
+        reason: str = "lingbot_dense_geometry_init",
+    ) -> dict[str, Any] | None:
+        dense_geometry_npz = Path(dense_geometry_npz).expanduser().resolve()
+        if not dense_geometry_npz.exists():
+            raise FileNotFoundError(f"Missing LingBot dense geometry: {dense_geometry_npz}")
+
+        dense = np.load(dense_geometry_npz)
+        gaussian_bundle = self._lingbot_dense_geometry_to_gaussian_bundle(dense)
+
+        submap_dir = self.output_dir / f"lingbot_dense_submap_{submap_id:04d}"
+        submap_dir.mkdir(parents=True, exist_ok=True)
+        if gaussian_bundle["xyz"].size == 0:
+            return {
+                "submap_id": submap_id,
+                "reason": reason,
+                "point_count": 0,
+                "pair_updates": 0,
+                "keyframe_count": 0,
+                "ply_path": "",
+                "npz_path": "",
+                "coarse_ply_path": "",
+                "coarse_npz_path": "",
+                "coarse_point_count": 0,
+                "recovered_seed_points": 0,
+                "lingbot_dense_source": str(dense_geometry_npz),
+            }
+
+        npz_path = submap_dir / "gaussians.npz"
+        ply_path = submap_dir / "gaussians.ply"
+        np.savez_compressed(npz_path, **gaussian_bundle)
+        self._write_ply(
+            ply_path,
+            gaussian_bundle["xyz"],
+            gaussian_bundle["rgb"],
+            gaussian_bundle["scale"],
+            gaussian_bundle["opacity"],
+            gaussian_bundle["axis_u"],
+            gaussian_bundle["axis_v"],
+        )
+        coarse = self._build_coarse_bundle(**gaussian_bundle)
+        coarse_npz_path = submap_dir / "gaussians_coarse.npz"
+        coarse_ply_path = submap_dir / "gaussians_coarse.ply"
+        np.savez_compressed(coarse_npz_path, **coarse)
+        self._write_ply(
+            coarse_ply_path,
+            coarse["xyz"],
+            coarse["rgb"],
+            coarse["scale"],
+            coarse["opacity"],
+            coarse["axis_u"],
+            coarse["axis_v"],
+        )
+
+        frame_count = 0
+        if "frame_indices" in dense:
+            frame_count = int(dense["frame_indices"].shape[0])
+        return {
+            "submap_id": submap_id,
+            "reason": reason,
+            "point_count": int(gaussian_bundle["xyz"].shape[0]),
+            "pair_updates": 0,
+            "keyframe_count": frame_count,
+            "ply_path": str(ply_path),
+            "npz_path": str(npz_path),
+            "coarse_ply_path": str(coarse_ply_path),
+            "coarse_npz_path": str(coarse_npz_path),
+            "coarse_point_count": int(coarse["xyz"].shape[0]),
+            "recovered_seed_points": 0,
+            "lingbot_dense_source": str(dense_geometry_npz),
+        }
+
     def _update_local_surface_volume(
         self,
         submap_id: int,
@@ -435,7 +613,8 @@ class IncrementalGaussianBuilder:
         voxel_ids = np.floor(xyz / voxel).astype(np.int32)
         _, unique_idx = np.unique(voxel_ids, axis=0, return_index=True)
         if unique_idx.shape[0] > self.config.gaussian_coarse_max_points:
-            coarse_score = unstable[unique_idx] + 0.35 * recentness[unique_idx] + 0.15 * opacity[unique_idx]
+            stability = 1.0 / (1.0 + np.clip(unstable[unique_idx], 0.0, 3.0))
+            coarse_score = 1.2 * stability + 0.4 * recentness[unique_idx] + 0.35 * opacity[unique_idx]
             keep = unique_idx[np.argpartition(coarse_score, -self.config.gaussian_coarse_max_points)[-self.config.gaussian_coarse_max_points :]]
             unique_idx = np.sort(keep)
         return {
@@ -449,6 +628,376 @@ class IncrementalGaussianBuilder:
             "recentness": recentness[unique_idx].astype(np.float32),
             "source": source[unique_idx].astype(np.int8),
         }
+
+    def _lingbot_dense_geometry_to_gaussian_bundle(
+        self,
+        dense: Any,
+    ) -> dict[str, np.ndarray]:
+        if "points_world" not in dense:
+            return self._empty_bundle()
+        xyz = dense["points_world"].astype(np.float32)
+        if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0:
+            return self._empty_bundle()
+
+        count = xyz.shape[0]
+        rgb = dense["point_rgb"].astype(np.uint8) if "point_rgb" in dense else np.full((count, 3), 127, dtype=np.uint8)
+        conf = dense["point_conf"].astype(np.float32) if "point_conf" in dense else np.ones((count,), dtype=np.float32)
+        frame_ids = dense["point_frame_local"].astype(np.int32) if "point_frame_local" in dense else np.zeros((count,), dtype=np.int32)
+        axis_u = dense["point_axis_u"].astype(np.float32) if "point_axis_u" in dense else None
+        axis_v = dense["point_axis_v"].astype(np.float32) if "point_axis_v" in dense else None
+        normals = dense["point_normal"].astype(np.float32) if "point_normal" in dense else np.zeros((count, 3), dtype=np.float32)
+
+        valid = np.isfinite(xyz).all(axis=1)
+        valid &= np.isfinite(conf)
+        if rgb.shape[0] != count:
+            rgb = np.full((count, 3), 127, dtype=np.uint8)
+        if normals.shape != xyz.shape:
+            normals = np.zeros_like(xyz, dtype=np.float32)
+        if axis_u is not None and axis_u.shape != xyz.shape:
+            axis_u = None
+        if axis_v is not None and axis_v.shape != xyz.shape:
+            axis_v = None
+        if frame_ids.shape[0] != count:
+            frame_ids = np.zeros((count,), dtype=np.int32)
+
+        valid_idx = np.flatnonzero(valid)
+        if valid_idx.size == 0:
+            return self._empty_bundle()
+        if valid_idx.size > self.config.gaussian_structured_max_points:
+            conf_valid = conf[valid_idx]
+            denom = float(np.percentile(conf_valid[np.isfinite(conf_valid)], 95)) if np.any(np.isfinite(conf_valid)) else 1.0
+            score = np.clip(conf_valid / max(denom, 1e-6), 0.0, 1.5)
+            keep_local = self._select_balanced_indices(
+                frame_ids=frame_ids[valid_idx],
+                score=score.astype(np.float32),
+                max_points=int(self.config.gaussian_structured_max_points),
+            )
+            valid_idx = valid_idx[keep_local]
+
+        xyz = xyz[valid_idx].astype(np.float32)
+        rgb = rgb[valid_idx].astype(np.uint8)
+        conf = conf[valid_idx].astype(np.float32)
+        normals = normals[valid_idx].astype(np.float32)
+        axis_u = axis_u[valid_idx].astype(np.float32) if axis_u is not None else None
+        axis_v = axis_v[valid_idx].astype(np.float32) if axis_v is not None else None
+
+        conf_finite = conf[np.isfinite(conf)]
+        denom = float(np.percentile(conf_finite, 95)) if conf_finite.size > 0 else 1.0
+        conf_norm = np.clip(conf / max(denom, 1e-6), 0.0, 1.0).astype(np.float32)
+
+        default_scale = float(self.config.gaussian_default_scale)
+        tangent_u, tangent_v = self._default_tangent_axes(normals, default_scale)
+        if axis_u is None or axis_v is None:
+            axis_u = tangent_u
+            axis_v = tangent_v
+            scale = np.full((xyz.shape[0],), default_scale, dtype=np.float32)
+        else:
+            norm_u = np.linalg.norm(axis_u, axis=1)
+            norm_v = np.linalg.norm(axis_v, axis=1)
+            bad_u = (~np.isfinite(norm_u)) | (norm_u < 1e-5)
+            bad_v = (~np.isfinite(norm_v)) | (norm_v < 1e-5)
+            axis_u[bad_u] = tangent_u[bad_u]
+            axis_v[bad_v] = tangent_v[bad_v]
+            norm_u = np.linalg.norm(axis_u, axis=1)
+            norm_v = np.linalg.norm(axis_v, axis=1)
+            scale = np.clip(
+                0.5 * (norm_u + norm_v),
+                0.35 * default_scale,
+                4.0 * default_scale,
+            ).astype(np.float32)
+
+        opacity = np.clip(0.42 + 0.4 * conf_norm, 0.12, 0.95).astype(np.float32)
+        unstable = np.clip(0.85 - 0.55 * conf_norm, 0.05, 0.75).astype(np.float32)
+        recentness = np.ones((xyz.shape[0],), dtype=np.float32)
+        source = np.full((xyz.shape[0],), 6, dtype=np.int8)
+        return {
+            "xyz": xyz,
+            "rgb": rgb,
+            "scale": scale,
+            "opacity": opacity,
+            "axis_u": axis_u.astype(np.float32),
+            "axis_v": axis_v.astype(np.float32),
+            "unstable": unstable,
+            "recentness": recentness,
+            "source": source,
+        }
+
+    def _select_balanced_indices(
+        self,
+        frame_ids: np.ndarray,
+        score: np.ndarray,
+        max_points: int,
+    ) -> np.ndarray:
+        if max_points <= 0 or frame_ids.size == 0:
+            return np.zeros((0,), dtype=np.int32)
+        if frame_ids.size <= max_points:
+            return np.arange(frame_ids.size, dtype=np.int32)
+
+        unique_frames = [int(frame_id) for frame_id in np.unique(frame_ids) if frame_id >= 0]
+        if len(unique_frames) <= 1:
+            keep = np.argpartition(score, -max_points)[-max_points:]
+            return keep[np.argsort(score[keep])[::-1]].astype(np.int32)
+
+        quota = max(1, max_points // len(unique_frames))
+        selected: list[int] = []
+        selected_mask = np.zeros((frame_ids.size,), dtype=bool)
+        for frame_id in unique_frames:
+            frame_idx = np.flatnonzero(frame_ids == frame_id)
+            if frame_idx.size == 0:
+                continue
+            take_count = min(quota, int(frame_idx.size))
+            top = frame_idx[np.argpartition(score[frame_idx], -take_count)[-take_count:]]
+            selected.extend(int(idx) for idx in top)
+            selected_mask[top] = True
+
+        if len(selected) < max_points:
+            remaining = np.flatnonzero(~selected_mask)
+            if remaining.size > 0:
+                take_count = min(max_points - len(selected), int(remaining.size))
+                top = remaining[np.argpartition(score[remaining], -take_count)[-take_count:]]
+                selected.extend(int(idx) for idx in top)
+
+        keep = np.asarray(selected[:max_points], dtype=np.int32)
+        return keep[np.argsort(score[keep])[::-1]].astype(np.int32)
+
+    def _default_tangent_axes(
+        self,
+        normals: np.ndarray,
+        default_scale: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if normals.ndim != 2 or normals.shape[1] != 3:
+            normals = np.zeros((0, 3), dtype=np.float32)
+        n = normals.astype(np.float32).copy()
+        norm = np.linalg.norm(n, axis=1, keepdims=True)
+        valid = norm[:, 0] > 1e-6
+        n[valid] /= norm[valid]
+        n[~valid] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        helper = np.repeat(np.array([[0.0, 1.0, 0.0]], dtype=np.float32), n.shape[0], axis=0)
+        near_parallel = np.abs(np.sum(n * helper, axis=1)) > 0.9
+        helper[near_parallel] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        axis_u = np.cross(n, helper).astype(np.float32)
+        axis_u_norm = np.linalg.norm(axis_u, axis=1, keepdims=True)
+        axis_u /= np.clip(axis_u_norm, 1e-6, None)
+        axis_v = np.cross(n, axis_u).astype(np.float32)
+        axis_v_norm = np.linalg.norm(axis_v, axis=1, keepdims=True)
+        axis_v /= np.clip(axis_v_norm, 1e-6, None)
+        axis_u *= default_scale
+        axis_v *= default_scale
+        return axis_u.astype(np.float32), axis_v.astype(np.float32)
+
+    def _lingbot_predictions_to_gaussian_bundle(
+        self,
+        bundle: Any,
+        image_paths: list[str],
+        summary: dict[str, Any] | None = None,
+    ) -> dict[str, np.ndarray]:
+        summary = summary or {}
+        metadata = summary.get("metadata", {})
+        cuvslam_poses_raw = metadata.get("cuvslam_poses", [])
+        cuvslam_poses = [np.asarray(item, dtype=np.float32) for item in cuvslam_poses_raw]
+
+        use_depth_reprojection = (
+            "depth" in bundle
+            and "intrinsic" in bundle
+            and len(cuvslam_poses) > 0
+        )
+        if use_depth_reprojection:
+            depth_maps = bundle["depth"].astype(np.float32)
+            if depth_maps.ndim == 4:
+                depth_maps = depth_maps[..., 0]
+            depth_conf = bundle["depth_conf"].astype(np.float32) if "depth_conf" in bundle else None
+            intrinsics = bundle["intrinsic"].astype(np.float32)
+            frame_count = min(depth_maps.shape[0], len(cuvslam_poses))
+        else:
+            if "world_points" not in bundle or "world_points_conf" not in bundle:
+                return self._empty_bundle()
+            world_points = bundle["world_points"].astype(np.float32)
+            world_conf = bundle["world_points_conf"].astype(np.float32)
+            if world_points.ndim != 4 or world_points.shape[0] == 0:
+                return self._empty_bundle()
+            frame_count = world_points.shape[0]
+
+        if frame_count == 0:
+            return self._empty_bundle()
+
+        rgb_frames = []
+        for path_str in image_paths:
+            frame_bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
+            if frame_bgr is None:
+                rgb_frames.append(None)
+            else:
+                rgb_frames.append(frame_bgr[:, :, ::-1].astype(np.uint8))
+
+        anchors: list[dict[str, Any]] = []
+        stride = max(4, int(self.config.gaussian_stereo_grid_stride))
+        min_conf = max(0.1, float(self.config.gaussian_local_volume_confidence_threshold))
+        for frame_idx in range(frame_count):
+            rgb = rgb_frames[frame_idx] if frame_idx < len(rgb_frames) else None
+            if use_depth_reprojection:
+                depth = depth_maps[frame_idx]
+                conf = depth_conf[frame_idx] if depth_conf is not None else np.ones_like(depth, dtype=np.float32)
+                K = intrinsics[frame_idx]
+                pose = cuvslam_poses[frame_idx]
+                h, w = depth.shape[:2]
+            else:
+                pts = world_points[frame_idx]
+                conf = world_conf[frame_idx]
+                h, w = pts.shape[:2]
+            for y in range(stride // 2, h - stride // 2, stride):
+                for x in range(stride // 2, w - stride // 2, stride):
+                    c = float(conf[y, x])
+                    if not np.isfinite(c) or c < min_conf:
+                        continue
+                    if use_depth_reprojection:
+                        depth_value = float(depth[y, x])
+                        if not np.isfinite(depth_value) or depth_value <= 0.05:
+                            continue
+                    else:
+                        point = pts[y, x]
+                        if not np.isfinite(point).all():
+                            continue
+                    patch_conf = conf[
+                        max(0, y - stride // 2) : min(h, y + stride // 2 + 1),
+                        max(0, x - stride // 2) : min(w, x + stride // 2 + 1),
+                    ]
+                    valid_ratio = float(np.mean(np.isfinite(patch_conf) & (patch_conf >= min_conf)))
+                    if valid_ratio < 0.35:
+                        continue
+
+                    x_u = min(w - 1, x + max(1, stride // 2))
+                    y_v = min(h - 1, y + max(1, stride // 2))
+                    if use_depth_reprojection:
+                        point = self._lingbot_backproject_pixel(K, pose, x, y, depth_value)
+                        depth_u = float(depth[y, x_u])
+                        depth_v = float(depth[y_v, x])
+                        p_u = self._lingbot_backproject_pixel(K, pose, x_u, y, depth_u) if np.isfinite(depth_u) and depth_u > 0.05 else point + np.array([self.config.gaussian_default_scale, 0.0, 0.0], dtype=np.float32)
+                        p_v = self._lingbot_backproject_pixel(K, pose, x, y_v, depth_v) if np.isfinite(depth_v) and depth_v > 0.05 else point + np.array([0.0, self.config.gaussian_default_scale, 0.0], dtype=np.float32)
+                    else:
+                        p_u = pts[y, x_u]
+                        p_v = pts[y_v, x]
+                        if not np.isfinite(p_u).all():
+                            p_u = point + np.array([self.config.gaussian_default_scale, 0.0, 0.0], dtype=np.float32)
+                        if not np.isfinite(p_v).all():
+                            p_v = point + np.array([0.0, self.config.gaussian_default_scale, 0.0], dtype=np.float32)
+                    axis_u = (p_u - point).astype(np.float32)
+                    axis_v = (p_v - point).astype(np.float32)
+                    if np.linalg.norm(axis_u) < 1e-4:
+                        axis_u = np.array([self.config.gaussian_default_scale, 0.0, 0.0], dtype=np.float32)
+                    if np.linalg.norm(axis_v) < 1e-4:
+                        axis_v = np.array([0.0, self.config.gaussian_default_scale, 0.0], dtype=np.float32)
+
+                    if rgb is None:
+                        color = np.array([127, 127, 127], dtype=np.uint8)
+                    else:
+                        xx = min(rgb.shape[1] - 1, int(np.clip(x * rgb.shape[1] / w, 0, rgb.shape[1] - 1)))
+                        yy = min(rgb.shape[0] - 1, int(np.clip(y * rgb.shape[0] / h, 0, rgb.shape[0] - 1)))
+                        color = rgb[yy, xx]
+
+                    spread = 0.5 * (np.linalg.norm(axis_u) + np.linalg.norm(axis_v))
+                    scale = np.clip(
+                        spread,
+                        0.35 * self.config.gaussian_default_scale,
+                        4.0 * self.config.gaussian_default_scale,
+                    )
+                    anchors.append(
+                        {
+                            "frame_idx": frame_idx,
+                            "center": point.astype(np.float32),
+                            "color": color.astype(np.uint8),
+                            "axis_u": axis_u.astype(np.float32),
+                            "axis_v": axis_v.astype(np.float32),
+                            "scale": float(scale),
+                            "opacity": float(np.clip(0.45 + 0.35 * c, 0.15, 0.95)),
+                            "unstable": float(np.clip(0.85 - 0.5 * c, 0.08, 0.7)),
+                            "recentness": 1.0,
+                        }
+                    )
+
+        if not anchors:
+            return self._empty_bundle()
+
+        if len(anchors) > self.config.gaussian_structured_max_points:
+            anchors = self._select_lingbot_anchors(anchors, int(self.config.gaussian_structured_max_points))
+
+        xyz = np.stack([item["center"] for item in anchors], axis=0).astype(np.float32)
+        rgb = np.stack([item["color"] for item in anchors], axis=0).astype(np.uint8)
+        scale = np.array([float(item["scale"]) for item in anchors], dtype=np.float32)
+        opacity = np.array([float(item["opacity"]) for item in anchors], dtype=np.float32)
+        axis_u = np.stack([item["axis_u"] for item in anchors], axis=0).astype(np.float32)
+        axis_v = np.stack([item["axis_v"] for item in anchors], axis=0).astype(np.float32)
+        unstable = np.array([float(item["unstable"]) for item in anchors], dtype=np.float32)
+        recentness = np.array([float(item["recentness"]) for item in anchors], dtype=np.float32)
+        source = np.full((xyz.shape[0],), 5, dtype=np.int8)
+        return {
+            "xyz": xyz,
+            "rgb": rgb,
+            "scale": scale,
+            "opacity": opacity,
+            "axis_u": axis_u,
+            "axis_v": axis_v,
+            "unstable": unstable,
+            "recentness": recentness,
+            "source": source,
+        }
+
+    def _select_lingbot_anchors(
+        self,
+        anchors: list[dict[str, Any]],
+        max_points: int,
+    ) -> list[dict[str, Any]]:
+        if max_points <= 0:
+            return []
+        conf_score = np.array(
+            [float(1.0 - item["unstable"] + 0.25 * item["opacity"]) for item in anchors],
+            dtype=np.float32,
+        )
+        frame_ids = np.array([int(item.get("frame_idx", -1)) for item in anchors], dtype=np.int32)
+        unique_frames = [int(frame_id) for frame_id in np.unique(frame_ids) if frame_id >= 0]
+        if len(unique_frames) <= 1:
+            keep = np.argpartition(conf_score, -max_points)[-max_points:]
+            return [anchors[idx] for idx in keep[np.argsort(conf_score[keep])[::-1]]]
+
+        # Keep LingBot keyframes represented evenly so one high-confidence frame
+        # cannot consume the whole structured Gaussian budget.
+        quota = max(1, max_points // len(unique_frames))
+        selected: list[int] = []
+        selected_mask = np.zeros((len(anchors),), dtype=bool)
+        for frame_id in unique_frames:
+            frame_idx = np.flatnonzero(frame_ids == frame_id)
+            if frame_idx.size == 0:
+                continue
+            take_count = min(quota, int(frame_idx.size))
+            top = frame_idx[np.argpartition(conf_score[frame_idx], -take_count)[-take_count:]]
+            selected.extend(int(idx) for idx in top)
+            selected_mask[top] = True
+
+        if len(selected) < max_points:
+            remaining = np.flatnonzero(~selected_mask)
+            if remaining.size > 0:
+                take_count = min(max_points - len(selected), int(remaining.size))
+                top = remaining[np.argpartition(conf_score[remaining], -take_count)[-take_count:]]
+                selected.extend(int(idx) for idx in top)
+
+        keep = np.asarray(selected[:max_points], dtype=np.int32)
+        return [anchors[idx] for idx in keep[np.argsort(conf_score[keep])[::-1]]]
+
+    def _lingbot_backproject_pixel(
+        self,
+        K: np.ndarray,
+        pose: np.ndarray,
+        x: int,
+        y: int,
+        depth_value: float,
+    ) -> np.ndarray:
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+        x_cam = (float(x) - cx) * depth_value / max(fx, 1e-6)
+        y_cam = (float(y) - cy) * depth_value / max(fy, 1e-6)
+        point_cam = np.array([x_cam, y_cam, depth_value], dtype=np.float32)
+        point_world = (pose[:3, :3] @ point_cam) + pose[:3, 3]
+        return point_world.astype(np.float32)
 
     def active_points(self, submap_id: int) -> dict[str, np.ndarray]:
         state = self.states.get(submap_id)
@@ -474,6 +1023,9 @@ class IncrementalGaussianBuilder:
         state = self.states.get(submap_id)
         if state is None or state.point_count <= 0 or not keyframes:
             return {"optimized_points": 0, "optimize_steps": 0}
+        if not self._should_optimize_for_keyframe(keyframes[-1]):
+            return {"optimized_points": 0, "optimize_steps": 0, "stream_optimize_skipped": True}
+        recover_refine_active = state.recover_refine_frames_left > 0
 
         bundle = self.active_points(submap_id)
         xyz = bundle["xyz"]
@@ -488,7 +1040,7 @@ class IncrementalGaussianBuilder:
         recent = keyframes[-max(1, self.config.gaussian_optimize_window) :]
         optimized_points = 0
         unstable = np.clip(
-            unstable * self.config.gaussian_optimize_unstable_decay + recentness * self.config.gaussian_optimize_new_point_boost,
+            unstable * self.config.gaussian_optimize_unstable_decay,
             0.0,
             3.0,
         ).astype(np.float32)
@@ -535,21 +1087,100 @@ class IncrementalGaussianBuilder:
                         unstable[valid],
                     )
 
-                select_score = unstable[valid] + 0.55 * recentness[valid]
+                depth_valid_all = None
+                depth_residual_all = None
                 if stereo_info is not None:
                     observed_depth_valid = self._sample_bilinear_gray(stereo_info["depth"], uv_valid)
                     observed_conf_valid = self._sample_bilinear_gray(stereo_info["confidence"], uv_valid)
-                    depth_residual_valid = np.abs(observed_depth_valid - xyz_camera[valid, 2]).astype(np.float32)
+                    depth_residual_all = np.abs(observed_depth_valid - xyz_camera[valid, 2]).astype(np.float32)
+                    depth_valid_all = np.isfinite(observed_depth_valid)
+                    depth_valid_all &= observed_depth_valid > 0.05
+                    depth_valid_all &= observed_conf_valid >= 0.1
+                    if self.config.gaussian_optimize_fast_refine_mode:
+                        depth_valid_all &= depth_residual_all <= (
+                            1.6 * max(1e-6, self.config.gaussian_optimize_depth_gate_m)
+                        )
+
+                if self.config.gaussian_optimize_fast_refine_mode:
+                    candidate_mask = (
+                        (recentness[valid] >= self.config.gaussian_optimize_candidate_recentness_floor)
+                        | (unstable[valid] >= self.config.gaussian_optimize_candidate_unstable_floor)
+                        | (source[valid] == 3)
+                        | (source[valid] == 4)
+                    )
+                    candidate_mask |= residual_mag >= (
+                        self.config.gaussian_optimize_candidate_error_ratio
+                        * self.config.gaussian_optimize_error_threshold
+                    )
+                    if depth_valid_all is not None:
+                        candidate_mask |= depth_valid_all
+                    if np.any(candidate_mask):
+                        valid_idx = valid_idx[candidate_mask]
+                        uv_valid = uv_valid[candidate_mask]
+                        sampled_rgb = sampled_rgb[candidate_mask]
+                        current_rgb = current_rgb[candidate_mask]
+                        residual = residual[candidate_mask]
+                        residual_mag = residual_mag[candidate_mask]
+                        if depth_valid_all is not None and depth_residual_all is not None:
+                            depth_valid_all = depth_valid_all[candidate_mask]
+                            depth_residual_all = depth_residual_all[candidate_mask]
+                    else:
+                        continue
+
+                select_score = unstable[valid_idx] + 0.55 * recentness[valid_idx]
+                if stereo_info is not None:
+                    observed_depth_valid = self._sample_bilinear_gray(stereo_info["depth"], uv_valid)
+                    observed_conf_valid = self._sample_bilinear_gray(stereo_info["confidence"], uv_valid)
+                    depth_residual_valid = np.abs(observed_depth_valid - xyz_camera[valid_idx, 2]).astype(np.float32)
                     depth_score = (
                         np.isfinite(observed_depth_valid).astype(np.float32)
                         * (observed_conf_valid >= 0.1).astype(np.float32)
                         * np.clip(depth_residual_valid / max(1e-6, self.config.gaussian_optimize_depth_gate_m), 0.0, 1.2)
                     )
                     select_score = select_score + self.config.gaussian_optimize_depth_score_weight * depth_score
+                source_valid = source[valid_idx]
+                select_score = np.where(
+                    source_valid == 3,
+                    select_score + self.config.gaussian_optimize_recovered_source_boost,
+                    select_score,
+                )
+                select_score = np.where(
+                    source_valid == 4,
+                    select_score + self.config.gaussian_optimize_structured_source_boost,
+                    select_score,
+                )
+                select_score = np.where(
+                    source_valid == 2,
+                    select_score + self.config.gaussian_optimize_pair_source_boost,
+                    select_score,
+                )
+                if recover_refine_active:
+                    select_score = np.where(
+                        source_valid == 3,
+                        select_score + self.config.gaussian_optimize_recover_boost,
+                        select_score,
+                    )
+                    select_score = np.where(
+                        source_valid == 4,
+                        select_score + self.config.gaussian_optimize_recover_structured_bonus,
+                        select_score,
+                    )
+                    select_score = select_score + self.config.gaussian_optimize_recover_recentness_bonus * recentness[valid_idx]
+                if depth_valid_all is not None:
+                    select_score = np.where(
+                        depth_valid_all,
+                        select_score + self.config.gaussian_optimize_depth_candidate_boost,
+                        select_score,
+                    )
                 error_boost = residual_mag >= self.config.gaussian_optimize_error_threshold
                 if np.any(error_boost):
                     select_score = np.where(error_boost, select_score + 0.8, select_score)
                 topk = min(self.config.gaussian_optimize_topk, valid_idx.shape[0])
+                if recover_refine_active:
+                    topk = min(
+                        valid_idx.shape[0],
+                        topk + int(self.config.gaussian_optimize_recover_extra_topk),
+                    )
                 if topk <= 0:
                     continue
                 if topk < valid_idx.shape[0]:
@@ -664,9 +1295,13 @@ class IncrementalGaussianBuilder:
             source,
         )
         state.optimize_steps += max(1, self.config.gaussian_optimize_steps)
+        if recover_refine_active:
+            state.recover_refine_frames_left = max(0, state.recover_refine_frames_left - 1)
         summary = self._state_summary(state)
         summary["optimized_points"] = optimized_points
         summary["optimize_steps"] = max(1, self.config.gaussian_optimize_steps)
+        summary["recover_refine_active"] = recover_refine_active
+        summary["recover_refine_frames_left"] = state.recover_refine_frames_left
         return summary
 
     def handle_points(self, handle: dict[str, Any] | None, use_coarse: bool = False) -> dict[str, np.ndarray]:
@@ -898,6 +1533,7 @@ class IncrementalGaussianBuilder:
             "stereo_updates": state.stereo_updates,
             "point_count": state.point_count,
             "recovered_seed_points": state.recovered_seed_points,
+            "recover_refine_frames_left": state.recover_refine_frames_left,
             "unstable_points": unstable_count,
             "local_volume_voxels": local_voxel_count,
         }
@@ -1134,6 +1770,15 @@ class IncrementalGaussianBuilder:
     ) -> np.ndarray:
         if not self.config.enable_semantic_like_region_filter:
             return np.ones(depth.shape, dtype=bool)
+        lingbot_sky_keep = np.ones(depth.shape, dtype=bool)
+        if self.config.enable_lingbot_style_sky_mask:
+            lingbot_sky_keep = self._sky_mask.build(
+                bgr=left_bgr,
+                gray=left_gray,
+                depth=depth,
+                texture=texture,
+                confidence=confidence,
+            )
         h, w = depth.shape
         yy = np.arange(h, dtype=np.float32)[:, None] / max(1.0, float(h - 1))
         brightness = left_gray.astype(np.float32)
@@ -1172,8 +1817,24 @@ class IncrementalGaussianBuilder:
         drop_u8 = (drop_mask.astype(np.uint8) * 255)
         drop_u8 = cv2.morphologyEx(drop_u8, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
         drop_u8 = cv2.morphologyEx(drop_u8, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
-        keep = drop_u8 == 0
+        keep = (drop_u8 == 0) & lingbot_sky_keep
         return keep.astype(bool)
+
+    def _should_append_stream_keyframe(
+        self,
+        state: IncrementalGaussianState,
+        keyframe: KeyframeRecord,
+    ) -> bool:
+        interval = max(1, int(self.config.gaussian_stream_keyframe_interval))
+        if state.last_keyframe is None or interval <= 1:
+            return True
+        return (keyframe.frame_idx % interval) == 0
+
+    def _should_optimize_for_keyframe(self, keyframe: KeyframeRecord) -> bool:
+        interval = max(1, int(self.config.gaussian_stream_optimize_interval))
+        if interval <= 1:
+            return True
+        return (keyframe.frame_idx % interval) == 0
 
     def _quadtree_sample_pixels(
         self,

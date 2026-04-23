@@ -1,23 +1,12 @@
-/home/nyu/Codespace/CVPR/cuVSLAM/.venv-jetson/bin/rerun \
-  /home/nyu/Codespace/CVPR/cuVSLAM/outputs/orin_nano_demo/synthetic_slam.rrd
-
-/home/nyu/Codespace/CVPR/cuVSLAM/.venv-jetson/bin/rerun \
-  /home/nyu/Codespace/CVPR/cuVSLAM/outputs/kitti/track_kitti_slam_seq06_full.rrd
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/nuc_output/ntuviral_spms02_cuvslam_vs_fastlivo2_dashboard.html \
+  19090
 
 cd /home/nyu/Codespace/CVPR/cuVSLAM
 CUVSLAM_RERUN_MODE=save \
   .venv-jetson/bin/python examples/kitti/track_kitti_slam.py \
   --force-remap \
   --rerun-file outputs/kitti/track_kitti_slam_seq06_full.rrd
-
-
-/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
-  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_v4_gaussian_live_800_viewer.html \
-  9090
-
-/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
-  /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_v4_gaussian_live_800_viewer.html \
-  9090
 
 /home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
   /home/nyu/Codespace/CVPR/HMR3D/nuc_output/kitti06_render_benchmark_surfel_denseviewer/render_triplets_viewer.html \
@@ -35,7 +24,17 @@ CUVSLAM_RERUN_MODE=save \
   /home/nyu/Codespace/CVPR/HMR3D/nuc_output/gaussian_triple_compare_semantic.html \
   19090
 
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/nuc_output/ntuviral_spms02_cuvslam_vs_fastlivo2_benchmark/benchmark_compare.html \
+  19090
+
+
 ssh -L 19090:127.0.0.1:19090 nyu@nuc-6913-frp
+
+ssh -N -L 8080:127.0.0.1:8080 -L 8081:127.0.0.1:8081 nyu@nuc-6913-frp
+
+
+http://127.0.0.1:19090/cuvslam_kitti06_viewer.html
 
 http://127.0.0.1:19090/render_triplets_viewer.html
 
@@ -43,4 +42,26 @@ http://127.0.0.1:9090/kitti06_v4_gaussian_live_800_viewer.html
 
 http://127.0.0.1:19090/gsconsole_compare_viewer.html
 
+http://127.0.0.1:19090/gaussian_triple_compare_v10_gsplat.html
+
+http://127.0.0.1:19090/ntuviral_spms02_cuvslam_vs_fastlivo2_dashboard.html
+
+
 source /home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/use_jetson_gpu_backend.sh
+
+# KITTI raw 2011_09_30 drive 0020 cuVSLAM vs FAST-LIVO2 benchmark.
+/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/open_gaussian_web.sh \
+  /home/nyu/Codespace/CVPR/nuc_output/kitti_raw_2011_09_30_0020_cuvslam_vs_fastlivo2_compare/benchmark_compare.html \
+  19090
+
+http://127.0.0.1:19090/benchmark_compare.html
+
+ssh nyu@nuc-6913-frp "cd /home/nyu/Codespace/CVPR && cuVSLAM/.venv-jetson/bin/python HMR3D/nuc/scripts/view_lingbot_predictions_viser.py --predictions-npz nuc_output/kitti06_cuvslam_lingbot_smoke/lingbot_predictions.npz --summary-json nuc_output/kitti06_cuvslam_lingbot_smoke/lingbot_summary.json --port 8081 --use-point-map --downsample-factor 1 --point-size 0.0015 --init-conf-threshold 1.0"
+
+ssh -N -L 18080:127.0.0.1:8080 -L 18081:127.0.0.1:8081 nyu@nuc-6913-frp
+
+
+
+tail -f /tmp/lingbot_120f.log
+
+ssh nyu@nuc-6913-frp "cd /home/nyu/Codespace/CVPR && cuVSLAM/.venv-jetson/bin/python HMR3D/nuc/scripts/view_lingbot_predictions_viser.py --predictions-npz nuc_output/kitti06_cuvslam_lingbot_120f/lingbot_predictions.npz --summary-json nuc_output/kitti06_cuvslam_lingbot_120f/lingbot_summary.json --port 8080 --downsample-factor 1 --point-size 0.0015 --init-conf-threshold 1.0"

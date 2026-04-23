@@ -94,6 +94,10 @@ class LocalSurfaceVolume:
         records = [record for record in records if record.observations >= max(1, self.config.gaussian_local_volume_min_observations)]
         if not records:
             return self._empty_bundle()
+        if self.config.enable_structured_gaussian_init:
+            structured = self._extract_structured_gaussians(records, max_points=max_points, default_scale=default_scale)
+            if structured["xyz"].size > 0:
+                return structured
         score = np.array(
             [record.confidence + 0.15 * min(8, record.observations) for record in records],
             dtype=np.float32,
@@ -117,6 +121,104 @@ class LocalSurfaceVolume:
         unstable = np.clip(0.85 / np.sqrt(np.clip(conf, 0.2, None)), 0.12, 0.78).astype(np.float32)
         recentness = np.clip(0.45 + 0.06 * np.minimum(obs, 6.0), 0.35, 0.92).astype(np.float32)
         source = np.full((xyz.shape[0],), 1, dtype=np.int8)
+        return {
+            "xyz": xyz,
+            "rgb": rgb,
+            "scale": scale,
+            "opacity": opacity,
+            "axis_u": axis_u,
+            "axis_v": axis_v,
+            "unstable": unstable,
+            "recentness": recentness,
+            "source": source,
+        }
+
+    def _extract_structured_gaussians(
+        self,
+        records: list[_VoxelRecord],
+        max_points: int,
+        default_scale: float,
+    ) -> dict[str, np.ndarray]:
+        if not records:
+            return self._empty_bundle()
+        anchor_voxel = max(
+            float(self.config.gaussian_local_volume_voxel_size),
+            float(self.config.gaussian_structured_anchor_voxel_size),
+        )
+        groups: dict[tuple[int, int, int], list[_VoxelRecord]] = {}
+        for record in records:
+            key = tuple(np.floor(record.position / anchor_voxel).astype(np.int32))
+            groups.setdefault(key, []).append(record)
+
+        anchors: list[dict[str, np.ndarray | float | int]] = []
+        for members in groups.values():
+            if len(members) < max(2, int(self.config.gaussian_structured_min_points_per_anchor)):
+                continue
+            positions = np.stack([m.position for m in members], axis=0).astype(np.float32)
+            colors = np.stack([m.rgb for m in members], axis=0).astype(np.float32)
+            conf = np.array([m.confidence for m in members], dtype=np.float32)
+            obs = np.array([m.observations for m in members], dtype=np.float32)
+            weight = np.clip(conf + 0.12 * obs, 0.05, None).astype(np.float32)
+            weight /= np.clip(weight.sum(), 1e-6, None)
+
+            center = np.sum(positions * weight[:, None], axis=0).astype(np.float32)
+            color = np.sum(colors * weight[:, None], axis=0).astype(np.float32)
+
+            centered = positions - center[None, :]
+            cov = (centered * weight[:, None]).T @ centered
+            cov += 1e-5 * np.eye(3, dtype=np.float32)
+            eigvals, eigvecs = np.linalg.eigh(cov.astype(np.float32))
+            order = np.argsort(eigvals)[::-1]
+            eigvals = eigvals[order].astype(np.float32)
+            eigvecs = eigvecs[:, order].astype(np.float32)
+
+            normal = eigvecs[:, 2]
+            axis_u_dir = eigvecs[:, 0]
+            axis_v_dir = eigvecs[:, 1]
+            spread_u = float(np.sqrt(max(1e-6, eigvals[0])))
+            spread_v = float(np.sqrt(max(1e-6, eigvals[1])))
+            spread_n = float(np.sqrt(max(1e-6, eigvals[2])))
+            anisotropy = float(self.config.gaussian_structured_anisotropy_gain)
+            scale_u = np.clip(anisotropy * spread_u, 0.45 * default_scale, 5.0 * default_scale)
+            scale_v = np.clip(anisotropy * spread_v, 0.45 * default_scale, 5.0 * default_scale)
+            isotropic = np.clip(
+                0.5 * (scale_u + scale_v) + 0.15 * spread_n,
+                0.35 * default_scale,
+                4.0 * default_scale,
+            )
+            confidence = float(np.mean(conf))
+            observations = int(np.sum(obs))
+            anchors.append(
+                {
+                    "center": center,
+                    "color": color,
+                    "axis_u": axis_u_dir * scale_u,
+                    "axis_v": axis_v_dir * scale_v,
+                    "scale": isotropic,
+                    "opacity": np.clip(0.62 + 0.05 * min(6, len(members)) + 0.04 * np.log1p(max(1.0, observations)), 0.22, 0.98),
+                    "unstable": np.clip(0.72 / np.sqrt(max(0.15, confidence)), 0.08, 0.64),
+                    "recentness": np.clip(0.42 + 0.05 * min(6, len(members)), 0.4, 0.92),
+                    "score": confidence + 0.1 * min(10, len(members)) + 0.1 * min(10, observations),
+                }
+            )
+
+        if not anchors:
+            return self._empty_bundle()
+        keep = min(len(anchors), max(1, int(min(max_points, self.config.gaussian_structured_max_points))))
+        if len(anchors) > keep:
+            score = np.array([float(item["score"]) for item in anchors], dtype=np.float32)
+            order = np.argpartition(score, -keep)[-keep:]
+            anchors = [anchors[idx] for idx in order[np.argsort(score[order])[::-1]]]
+
+        xyz = np.stack([item["center"] for item in anchors], axis=0).astype(np.float32)
+        rgb = np.clip(np.stack([item["color"] for item in anchors], axis=0), 0.0, 255.0).astype(np.uint8)
+        scale = np.array([float(item["scale"]) for item in anchors], dtype=np.float32)
+        opacity = np.array([float(item["opacity"]) for item in anchors], dtype=np.float32)
+        axis_u = np.stack([item["axis_u"] for item in anchors], axis=0).astype(np.float32)
+        axis_v = np.stack([item["axis_v"] for item in anchors], axis=0).astype(np.float32)
+        unstable = np.array([float(item["unstable"]) for item in anchors], dtype=np.float32)
+        recentness = np.array([float(item["recentness"]) for item in anchors], dtype=np.float32)
+        source = np.full((xyz.shape[0],), 4, dtype=np.int8)
         return {
             "xyz": xyz,
             "rgb": rgb,
