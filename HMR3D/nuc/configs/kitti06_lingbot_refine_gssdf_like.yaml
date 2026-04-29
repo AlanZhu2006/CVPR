@@ -1,0 +1,72 @@
+input:
+  frame_step: 5
+  max_frames: 200
+
+memory:
+  gaussian_default_scale: 0.05
+  gaussian_structured_max_points: 4800
+  gaussian_coarse_voxel_size: 0.42
+  gaussian_coarse_max_points: 4800
+
+output:
+  output_dir: nuc_output/kitti06_lingbot_refine_gssdf_like
+  render_backend: gsplat
+  render_save_images: true
+  render_compare_stride: 5
+  render_min_radius_px: 1.2
+  render_max_radius_px: 15.0
+  render_internal_scale: 1.0
+  render_depth_window_m: 60.0
+  render_view_budget_points: 16000
+  render_gsplat_tile_size: 16
+  render_gsplat_radius_clip: 0.0
+  render_gsplat_rasterize_mode: classic
+
+refine:
+  refine_steps: 500
+  batch_size: 3
+  image_scale: 1.0
+  lr_xyz: 0.001
+  lr_scale: 0.0005
+  lr_rotation: 0.001
+  lr_opacity: 0.004
+  lr_rgb: 0.01
+  lambda_depth: 0.15
+  lambda_opacity: 0.0001
+  lambda_scale: 0.0001
+  lambda_rotation: 0.00005
+  lambda_isotropic: 0.001
+  lambda_tangent_max: 0.001
+  lambda_normal_max: 0.0005
+  lambda_anisotropy_ratio: 0.0005
+  lambda_render_normal: 0.05
+  lambda_anchor: 0.0001
+  lambda_rgb_anchor: 0.0
+  lambda_opacity_anchor: 0.0
+  depth_conf_threshold: 1.0
+  depth_alpha_threshold: 0.01
+  normal_alpha_threshold: 0.05
+  prune_every: 50
+  min_opacity: 0.02
+  max_points: 4800
+  preview_every: 100
+  preview_frames: 3
+  rgb_ssim_weight: 0.2
+  background_gray: 0.0
+  near_plane: 0.01
+  far_plane: 60.0
+  radius_clip: 0.0
+  tile_size: 16
+  rasterize_mode: classic
+  init_max_tangent_scale: 2.0
+  init_max_normal_scale: 0.12
+  train_max_tangent_scale: 2.0
+  train_max_normal_scale: 0.12
+  max_anisotropy_ratio: 6.0
+  split_large_count: 96
+  split_scale_threshold: 0.8
+  split_anisotropy_threshold: 4.0
+  split_offset_ratio: 0.3
+  split_scale_shrink: 1.8
+  random_seed: 13
+  device: cuda

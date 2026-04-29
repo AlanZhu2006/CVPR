@@ -279,6 +279,156 @@
 
 它依赖的是固定后端：
 
+## 5.5 `方案 B`: cuVSLAM + LingBot-style Reconstruction Baseline
+
+为了避免继续只在当前轻量 Gaussian 原型上做微调，这一轮已经开始建立一条新的 3D 重建 baseline：
+
+- `cuVSLAM` 继续负责前端 tracking / pose metadata
+- `LingBot-Map` 先作为 streaming 3D reconstruction baseline
+- 后续再考虑怎样把这条更强的局部几何底座接回 `HMR3D + Gaussian`
+
+当前已完成：
+
+- 参考仓准备：
+  - [third_party_research/lingbot-map](/home/nyu/Codespace/CVPR/third_party_research/lingbot-map)
+  - [third_party_research/Gaussian-SLAM](/home/nyu/Codespace/CVPR/third_party_research/Gaussian-SLAM)
+  - [third_party_research/GSFusion](/home/nyu/Codespace/CVPR/third_party_research/GSFusion)
+- `LingBot-Map` checkpoint 下载完成：
+  - [lingbot-map.pt](/home/nyu/Codespace/CVPR/third_party_research/lingbot_cache/lingbot-map.pt)
+- 针对 Jetson/Orin Nano 修复了 checkpoint 加载方式：
+  - 在 [third_party_research/lingbot-map/demo.py](/home/nyu/Codespace/CVPR/third_party_research/lingbot-map/demo.py) 里改成 `CPU + mmap` 低峰值加载
+- 补了 LingBot 导出与 `cuVSLAM + LingBot` 最小适配层：
+  - [lingbot_adapter.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/lingbot_adapter.py:1)
+  - [run_lingbot_smoke.sh](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_lingbot_smoke.sh:1)
+  - [run_lingbot_export.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_lingbot_export.py:1)
+  - [run_cuvslam_lingbot_recon.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_cuvslam_lingbot_recon.py:1)
+
+当前已验证的结论：
+
+- `LingBot-Map` 在 Orin Nano 上
+  - 原始 GPU 路径会在 checkpoint load 时 OOM
+  - 原始 CPU 路径会被系统以 `137` 杀掉
+  - `CPU + mmap` 路径已经成功跑通最小 streaming smoke
+- 最小 `cuVSLAM + LingBot` 导出已跑通：
+  - 输出目录：[kitti06_cuvslam_lingbot_smoke](/home/nyu/Codespace/CVPR/nuc_output/kitti06_cuvslam_lingbot_smoke)
+  - 预测：[lingbot_predictions.npz](/home/nyu/Codespace/CVPR/nuc_output/kitti06_cuvslam_lingbot_smoke/lingbot_predictions.npz)
+  - 汇总：[lingbot_summary.json](/home/nyu/Codespace/CVPR/nuc_output/kitti06_cuvslam_lingbot_smoke/lingbot_summary.json)
+
+这个最小 `方案 B` 目前做到了：
+
+- 用 `cuVSLAM` 选取 keyframe window
+- 在这个 window 上跑 `LingBot` reconstruction
+- 把 `depth / depth_conf / world_points / world_points_conf / extrinsic / intrinsic` 落盘
+- 同时保留 `cuVSLAM` 的：
+  - `frame_indices`
+  - `timestamps`
+  - `poses`
+  - `descriptors`
+
+这说明：
+
+> 现在已经有一条真正可运行的 `cuVSLAM pose metadata + LingBot reconstruction export` 基线，不再只是口头方案。
+
+### 5.6 `LingBot recon -> Gaussian init` 正式对比
+
+在 `方案 B` 跑通之后，这一轮继续把 `LingBot` 导出真正接到了现有 Gaussian 初始化链里，并且和当前代表线做了正式对比：
+
+- `LingBot` 适配与导出：
+  [lingbot_adapter.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/src/nuc_runtime/lingbot_adapter.py:1)
+- `LingBot -> Gaussian handle`：
+  [run_lingbot_gaussian_init.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_lingbot_gaussian_init.py:1)
+- `LingBot Gaussian benchmark`：
+  [run_lingbot_gaussian_benchmark.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_lingbot_gaussian_benchmark.py:1)
+- 四路对比页：
+  [gaussian_quad_compare_lingbot_vs_v9_v11_v12.html](/home/nyu/Codespace/CVPR/nuc_output/gaussian_quad_compare_lingbot_vs_v9_v11_v12.html:1)
+
+为了保证对比公平，这次对比统一取了共同帧 `frame_idx = [0, 25]`。最早第一版会出现黑屏，原因不是没有点，而是直接使用了 `LingBot world_points` 作为全局世界坐标，和当前 renderer 的世界坐标定义并不一致。后续已经修成：
+
+- 优先使用 `LingBot depth + intrinsic`
+- 再配合 `cuVSLAM pose`
+- 重新反投影到我们自己的世界坐标
+
+对齐后的输出：
+- [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_lingbot_gaussian_cmp_aligned/render_benchmark_summary.json:1)
+- [gaussian_quad_compare_lingbot_aligned_vs_v9_v11_v12.html](/home/nyu/Codespace/CVPR/nuc_output/gaussian_quad_compare_lingbot_aligned_vs_v9_v11_v12.html:1)
+- [lingbot_aligned_vs_v9_v11_v12_common_frames_summary.json](/home/nyu/Codespace/CVPR/nuc_output/lingbot_aligned_vs_v9_v11_v12_common_frames_summary.json:1)
+
+当前结果：
+
+- `LingBot Recon -> Gaussian Init (Aligned)`
+  - `PSNR 10.1836`
+  - `SSIM 0.22636`
+  - `render 541.297 ms`
+- `v9 Structured Init`
+  - `PSNR 11.0951`
+  - `SSIM 0.27016`
+  - `render 1002.211 ms`
+- `v11 Structured Fast Refine`
+  - `PSNR 10.7651`
+  - `SSIM 0.23940`
+  - `render 734.909 ms`
+- `v12 Recover-aware Structured`
+  - `PSNR 10.7600`
+  - `SSIM 0.24019`
+  - `render 735.170 ms`
+
+这次结果说明：
+
+- `LingBot` 的 streaming 3D reconstruction 输出已经可以直接进入 Gaussian 初始化链
+- 黑屏问题来自最初坐标系未对齐，而不是 `LingBot` 没有输出 3D 数据
+- 对齐后，这条线已经进入“可和现有 structured 线正常比较”的状态
+- 它还没有自然带来更高画质
+- 但它比 `v9 / v11 / v12` 更快，也说明 `LingBot` 分支更适合继续往“更强重建底座 + 轻量 refinement”方向深化
+
+### 5.7 `v13`: LingBot Structured Init + Fast Refine + Recover-aware Refine
+
+为了验证“`LingBot` 这条更强重建底座，完整吸收 `v11 / v12` 优势后会不会成为主线”，这轮又补了：
+
+- [kitti06_v13_lingbot_structured_recover_refine.yaml](/home/nyu/Codespace/CVPR/HMR3D/nuc/configs/kitti06_v13_lingbot_structured_recover_refine.yaml:1)
+- [run_lingbot_structured_refine_benchmark.py](/home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/run_lingbot_structured_refine_benchmark.py:1)
+
+这条线做的事不是静态初始化，而是：
+
+- 以 `LingBot aligned` 的 Gaussian 作为 structured init
+- 把点源标成 structured source
+- 打开 `fast refine`
+- 同时打开 `recover-aware refine` 的权重调度
+
+输出：
+
+- [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v13_lingbot_structured_recover_refine/render_benchmark_summary.json:1)
+- [gaussian_quad_compare_v13_lingbot_vs_aligned_v11_v12.html](/home/nyu/Codespace/CVPR/nuc_output/gaussian_quad_compare_v13_lingbot_vs_aligned_v11_v12.html:1)
+- [v13_lingbot_vs_aligned_v11_v12_common_frames_summary.json](/home/nyu/Codespace/CVPR/nuc_output/v13_lingbot_vs_aligned_v11_v12_common_frames_summary.json:1)
+
+共同帧结果：
+
+- `v13 LingBot + Structured Fast/Recover Refine`
+  - `PSNR 10.1562`
+  - `SSIM 0.22120`
+  - `update 179.740 ms`
+  - `render 425.218 ms`
+- `LingBot Recon -> Gaussian Init (Aligned)`
+  - `PSNR 10.1836`
+  - `SSIM 0.22636`
+  - `render 541.297 ms`
+- `v11 Structured Fast Refine`
+  - `PSNR 10.7651`
+  - `SSIM 0.23940`
+  - `update 759.370 ms`
+  - `render 734.909 ms`
+- `v12 Recover-aware Structured`
+  - `PSNR 10.7600`
+  - `SSIM 0.24019`
+  - `update 750.673 ms`
+  - `render 735.170 ms`
+
+这次结果说明：
+
+- `v13` 确实吸收了 `v11 / v12` 的在线优化优势
+- 但当前收益主要体现为**更轻、更快**
+- 画质还没有超过现有 `v11 / v12`
+- 这说明 `LingBot` 分支还需要继续做“更强重建底座 + 更轻局部 refinement”的组合优化，而不是简单初始化后直接替代现有 structured 主线
+
 - `FAST-LIVO2`
 - `GS-SDF`
 - `rosbridge`
@@ -778,6 +928,45 @@
 - 但画质提升仍然有限
 - 它更像是在为以后真正的实时版本打下更合理的区域调度基础
 
+### 10.4 LingBot-Map 风格轻量借鉴
+
+为了验证“能不能借现有 streaming reconstruction 的轻量流式机制，而不把系统继续推向重后端”，当前又补了一条 `LingBot-Map` 风格借鉴线：
+
+- 模块化 `sky mask`
+- `keyframe interval` 风格的 Gaussian append cadence
+- `optimize interval` 风格的流式优化节奏
+
+相关文件和结果：
+
+- 配置：
+  [kitti06_v8_lingbot_borrowed.yaml](/home/nyu/Codespace/CVPR/HMR3D/nuc/configs/kitti06_v8_lingbot_borrowed.yaml)
+- 结果：
+  [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v8_lingbot_borrowed/render_benchmark_summary.json)
+- triplet 页面：
+  [render_triplets_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v8_lingbot_borrowed/render_triplets_viewer.html:1)
+- compare 页面：
+  [gsconsole_compare_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v8_lingbot_borrowed/gsconsole_compare_viewer.html:1)
+- 三路对比：
+  [gaussian_triple_compare_lingbot.html](/home/nyu/Codespace/CVPR/nuc_output/gaussian_triple_compare_lingbot.html:1)
+
+这条线的结果很清楚：
+
+- `mean_psnr = 11.4331`
+- `mean_ssim = 0.29443`
+- `mean_update_ms = 856.691`
+- `mean_render_ms = 1148.231`
+- `approx_fps = 0.499`
+
+这说明：
+
+- `LingBot-Map` 风格的轻量流式借鉴更像“前端预算和节奏控制器”
+- 它对降低更新/渲染负担是有帮助的
+- 但它本身不是高质量 Gaussian renderer，也不会直接替代 `HMR3D` 的长期记忆层
+
+因此这条结果反而更支持当前项目的主判断：
+
+> `LingBot-Map` 这类方法适合被借来增强前端流式节奏，但真正有研究辨识度的主线，仍然是 `cuVSLAM + HMR3D memory-native Gaussian lifecycle`。
+
 当前项目已经完成了最难的前半段：
 
 - `cuVSLAM` 跑通
@@ -804,3 +993,136 @@
 - 提升局部几何质量
 - 提升 render 效率
 - 再逐步上实机
+
+### 10.5 `gsplat` GPU Backend Adapter
+
+为了验证“当前系统是否已经具备挂成熟 GPU backend 的结构条件”，这轮又给 renderer 增加了一条可切换的 `gsplat` backend 路径。
+
+这次做的不是替换 `HMR3D` 主线，而是：
+
+- 保留现有 `cuVSLAM + HMR3D + Gaussian lifecycle`
+- 保留原有 CPU 近似 renderer
+- 在此基础上新增 `render_backend=gsplat`
+- 在 Jetson Orin Nano 的 GPU Python 环境里真实跑通一版 benchmark
+
+相关文件和结果：
+
+- 配置：
+  [kitti06_v10_gsplat_backend.yaml](/home/nyu/Codespace/CVPR/HMR3D/nuc/configs/kitti06_v10_gsplat_backend.yaml)
+- 结果：
+  [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v10_gsplat_backend/render_benchmark_summary.json)
+- triplet 页面：
+  [render_triplets_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v10_gsplat_backend/render_triplets_viewer.html:1)
+- compare 页面：
+  [gsconsole_compare_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v10_gsplat_backend/gsconsole_compare_viewer.html:1)
+- 三路对比：
+  [gaussian_triple_compare_v10_gsplat.html](/home/nyu/Codespace/CVPR/nuc_output/gaussian_triple_compare_v10_gsplat.html:1)
+
+当前结果：
+
+- `mean_psnr = 9.7931`
+- `mean_ssim = 0.17969`
+- `mean_update_ms = 820.801`
+- `mean_render_ms = 1598.007`
+- `approx_fps = 0.413`
+
+这条线说明了三件事：
+
+- `gsplat` backend adapter 已经真正接通
+- Jetson Orin Nano 当前环境已经具备 `torch + gsplat` 运行条件
+- 但第一版 `gsplat` 路径画质还不如现有 CPU 代表线，说明当前瓶颈已经转向输入几何质量和参数映射，而不只是“有没有成熟 backend”
+
+因此，这一步的价值主要是：
+
+- 证明当前系统已经不再被锁死在自写 CPU renderer
+- 后续可以在不改 `HMR3D` lifecycle 的前提下，继续打磨 GPU backend 路径
+- 进一步把研究重点收束到真正有辨识度的主线：
+  `cuVSLAM + HMR3D memory-native Gaussian lifecycle + switchable backend`
+
+### 10.6 `v11`: Structured Fast Refine
+
+为了回答“`v9` 这条线是不是成立，只是还缺实时约束下的轻量 refinement”，这轮又补了一条 `v11 structured fast refine`。
+
+这次不再继续加重几何前半段，而是：
+
+- 保留 `v9` 的 structured Gaussian initialization
+- 增加 `fast refine mode`
+- 只保留当前可见、最近、高误差、recover 影响到的点作为候选
+- 只对少量高价值 Gaussian 做小步 refinement
+
+相关文件和结果：
+
+- 配置：
+  [kitti06_v11_structured_fast_refine.yaml](/home/nyu/Codespace/CVPR/HMR3D/nuc/configs/kitti06_v11_structured_fast_refine.yaml)
+- 结果：
+  [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v11_structured_fast_refine/render_benchmark_summary.json)
+- triplet 页面：
+  [render_triplets_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v11_structured_fast_refine/render_triplets_viewer.html:1)
+- compare 页面：
+  [gsconsole_compare_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v11_structured_fast_refine/gsconsole_compare_viewer.html:1)
+- 三路对比：
+  [gaussian_triple_compare_v11.html](/home/nyu/Codespace/CVPR/nuc_output/gaussian_triple_compare_v11.html:1)
+
+当前结果：
+
+- `mean_psnr = 10.6207`
+- `mean_ssim = 0.24647`
+- `mean_update_ms = 809.511`
+- `mean_render_ms = 891.105`
+- `approx_fps = 0.588`
+
+和 `v9 structured init` 对比，这条线说明：
+
+- `v9` 的结构化初始化方向是成立的
+- 继续往重几何走不是最优下一步
+- 更合适的是在 `v9` 后面加 realtime-friendly 的轻量 refinement
+
+虽然 `v11` 目前还没有追上 `Realtime Budget` 的画质，但它已经把 `v9` 往更接近实时前端的方向推了一步：
+
+- 比 `v9` 更快
+- 不再继续扩大前端几何负担
+- 更符合“`cuVSLAM + HMR3D + structured Gaussian + fast refine`”这条新主线
+
+### 10.7 `v12`: Recover-aware Structured Fast Refine
+
+为了把 `HMR3D` 的长期记忆真正接进 Gaussian 优化本身，这轮在 `v11` 基础上又补了一条 `v12 recover-aware structured fast refine`。
+
+这次不是再改前半段几何，而是：
+
+- 保留 `v11` 的 structured init + fast refine
+- 利用 warm-start / recover 事件
+- 在 recover 发生后的若干帧里，把 refinement 预算更多给：
+  - recovered 来源的 Gaussian
+  - structured 来源的 Gaussian
+  - 最近被记忆事件影响到的点
+
+相关文件和结果：
+
+- 配置：
+  [kitti06_v12_recover_aware_structured.yaml](/home/nyu/Codespace/CVPR/HMR3D/nuc/configs/kitti06_v12_recover_aware_structured.yaml)
+- 结果：
+  [render_benchmark_summary.json](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v12_recover_aware_structured/render_benchmark_summary.json)
+- triplet 页面：
+  [render_triplets_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v12_recover_aware_structured/render_triplets_viewer.html:1)
+- compare 页面：
+  [gsconsole_compare_viewer.html](/home/nyu/Codespace/CVPR/nuc_output/kitti06_render_benchmark_v12_recover_aware_structured/gsconsole_compare_viewer.html:1)
+- 三路对比：
+  [gaussian_triple_compare_v12.html](/home/nyu/Codespace/CVPR/nuc_output/gaussian_triple_compare_v12.html:1)
+
+当前结果：
+
+- `mean_psnr = 10.6844`
+- `mean_ssim = 0.2515`
+- `mean_update_ms = 810.641`
+- `mean_render_ms = 911.179`
+- `approx_fps = 0.581`
+
+这条结果说明：
+
+- 把 recover 事件接进 refinement 预算这件事是有作用的
+- 相比 `v11`，指标有小幅前进
+- 但收益目前仍然是渐进式的，而不是立刻带来大幅画质跃升
+
+因此，当前最准确的判断是：
+
+> `v12` 已经开始体现“memory-native Gaussian system”的真正特色，但还需要继续把 recover-aware refinement 做得更细，才能把 `HMR3D` 的优势真正转化成画质和稳定性收益。

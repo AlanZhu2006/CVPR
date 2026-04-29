@@ -59,6 +59,34 @@ class GaussianSplatRenderer:
             projected_points=projected,
         )
 
+    def render_bundle_view(
+        self,
+        bundle: dict[str, np.ndarray],
+        pose: np.ndarray,
+        image_shape: tuple[int, int],
+        image_path: str | None,
+        *,
+        active_points: int | None = None,
+        archived_points: int | None = None,
+        warmstart_points: int | None = None,
+    ) -> RenderResult:
+        normalized = self._normalize_external_bundle(bundle)
+        render_rgb, projected = self._render_bundle(
+            normalized,
+            pose=pose,
+            image_shape=image_shape,
+            image_path=image_path,
+        )
+        count = int(normalized["xyz"].shape[0])
+        return RenderResult(
+            image_rgb=render_rgb,
+            point_count=count,
+            active_points=int(active_points if active_points is not None else count),
+            archived_points=int(archived_points if archived_points is not None else 0),
+            warmstart_points=int(warmstart_points if warmstart_points is not None else 0),
+            projected_points=projected,
+        )
+
     def _collect_active_bundle(
         self,
         router: MemoryRouter,
@@ -115,6 +143,22 @@ class GaussianSplatRenderer:
             "provenance": np.concatenate([bundle["provenance"] for bundle in bundles]).astype(np.int8),
         }
 
+    def _normalize_external_bundle(self, bundle: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        count = int(bundle.get("xyz", np.zeros((0, 3), dtype=np.float32)).shape[0])
+        normalized = {
+            "xyz": bundle.get("xyz", np.zeros((0, 3), dtype=np.float32)).astype(np.float32),
+            "rgb": bundle.get("rgb", np.zeros((0, 3), dtype=np.uint8)).astype(np.uint8),
+            "scale": bundle.get("scale", np.zeros((count,), dtype=np.float32)).astype(np.float32),
+            "opacity": bundle.get("opacity", np.zeros((count,), dtype=np.float32)).astype(np.float32),
+            "axis_u": bundle.get("axis_u", np.zeros((count, 3), dtype=np.float32)).astype(np.float32),
+            "axis_v": bundle.get("axis_v", np.zeros((count, 3), dtype=np.float32)).astype(np.float32),
+            "unstable": bundle.get("unstable", np.zeros((count,), dtype=np.float32)).astype(np.float32),
+            "recentness": bundle.get("recentness", np.zeros((count,), dtype=np.float32)).astype(np.float32),
+            "source": bundle.get("source", np.zeros((count,), dtype=np.int8)).astype(np.int8),
+            "provenance": bundle.get("provenance", np.full((count,), 3, dtype=np.int8)).astype(np.int8),
+        }
+        return normalized
+
     def _limit_bundle_points(self, bundle: dict[str, np.ndarray], max_points: int) -> dict[str, np.ndarray]:
         count = int(bundle["xyz"].shape[0])
         if count <= 0 or count <= max_points:
@@ -144,6 +188,37 @@ class GaussianSplatRenderer:
         return tagged
 
     def _render_bundle(
+        self,
+        bundle: dict[str, np.ndarray],
+        pose: np.ndarray,
+        image_shape: tuple[int, int],
+        image_path: str | None,
+    ) -> tuple[np.ndarray, int]:
+        backend = (self.output_config.render_backend or "cpu").strip().lower()
+        if backend == "gsplat":
+            try:
+                return self._render_bundle_gsplat(
+                    bundle=bundle,
+                    pose=pose,
+                    image_shape=image_shape,
+                    image_path=image_path,
+                )
+            except Exception:
+                # Fall back to the existing CPU renderer if gsplat is unavailable or fails.
+                return self._render_bundle_cpu(
+                    bundle=bundle,
+                    pose=pose,
+                    image_shape=image_shape,
+                    image_path=image_path,
+                )
+        return self._render_bundle_cpu(
+            bundle=bundle,
+            pose=pose,
+            image_shape=image_shape,
+            image_path=image_path,
+        )
+
+    def _render_bundle_cpu(
         self,
         bundle: dict[str, np.ndarray],
         pose: np.ndarray,
@@ -187,6 +262,8 @@ class GaussianSplatRenderer:
         depth = xyz_camera[:, 2].astype(np.float32)
         radius_px = np.clip(K[0, 0] * scale / np.clip(depth, 1e-4, None), self.output_config.render_min_radius_px, self.output_config.render_max_radius_px)
         keep = self._view_aware_budget(
+            uv=uv,
+            canvas_shape=(render_h, render_w),
             depth=depth,
             radius_px=radius_px,
             unstable=unstable,
@@ -225,8 +302,117 @@ class GaussianSplatRenderer:
             composed_u8 = cv2.resize(composed_u8, (w, h), interpolation=cv2.INTER_CUBIC)
         return composed_u8, projected_points
 
+    def _render_bundle_gsplat(
+        self,
+        bundle: dict[str, np.ndarray],
+        pose: np.ndarray,
+        image_shape: tuple[int, int],
+        image_path: str | None,
+    ) -> tuple[np.ndarray, int]:
+        import torch
+        import gsplat
+
+        h, w = image_shape
+        if bundle["xyz"].shape[0] == 0:
+            blank = np.full((h, w, 3), self.output_config.render_background_gray, dtype=np.uint8)
+            return blank, 0
+        if not torch.cuda.is_available():
+            raise RuntimeError("gsplat backend requested but CUDA is unavailable")
+
+        K = self._load_intrinsics(image_path, w=w, h=h).astype(np.float32)
+        xyz_camera = self._world_to_camera(pose, bundle["xyz"])
+        valid = np.isfinite(xyz_camera).all(axis=1)
+        valid &= xyz_camera[:, 2] > 0.05
+        valid &= xyz_camera[:, 2] <= self.output_config.render_depth_window_m
+        if not np.any(valid):
+            blank = np.full((h, w, 3), self.output_config.render_background_gray, dtype=np.uint8)
+            return blank, 0
+
+        xyz = bundle["xyz"][valid].astype(np.float32)
+        rgb = bundle["rgb"][valid].astype(np.float32) / 255.0
+        opacity = np.clip(bundle["opacity"][valid].astype(np.float32), 0.0, 0.999)
+        axis_u = bundle["axis_u"][valid].astype(np.float32)
+        axis_v = bundle["axis_v"][valid].astype(np.float32)
+        unstable = bundle["unstable"][valid].astype(np.float32)
+        recentness = bundle["recentness"][valid].astype(np.float32)
+        source = bundle["source"][valid].astype(np.int8)
+        provenance = bundle["provenance"][valid].astype(np.int8)
+
+        xyz_camera = xyz_camera[valid]
+        radius_px = np.clip(
+            K[0, 0] * bundle["scale"][valid].astype(np.float32) / np.clip(xyz_camera[:, 2], 1e-4, None),
+            self.output_config.render_min_radius_px,
+            self.output_config.render_max_radius_px,
+        )
+        keep = self._view_aware_budget(
+            uv=(xyz_camera[:, :2] @ K[:2, :2].T) / np.clip(xyz_camera[:, 2:], 1e-8, None)
+            + K[:2, 2][None, :],
+            canvas_shape=(h, w),
+            depth=xyz_camera[:, 2].astype(np.float32),
+            radius_px=radius_px,
+            unstable=unstable,
+            recentness=recentness,
+            source=source,
+            provenance=provenance,
+        )
+        xyz = xyz[keep]
+        rgb = rgb[keep]
+        opacity = opacity[keep]
+        axis_u = axis_u[keep]
+        axis_v = axis_v[keep]
+        scale_base = bundle["scale"][valid].astype(np.float32)[keep]
+        projected_points = int(xyz.shape[0])
+        if projected_points <= 0:
+            blank = np.full((h, w, 3), self.output_config.render_background_gray, dtype=np.uint8)
+            return blank, 0
+
+        means = torch.from_numpy(xyz).to(device="cuda", dtype=torch.float32)
+        colors = torch.from_numpy(rgb).to(device="cuda", dtype=torch.float32)
+        opacities = torch.from_numpy(opacity).to(device="cuda", dtype=torch.float32)
+        scales, quats = self._axes_to_gsplat_params(axis_u=axis_u, axis_v=axis_v, scale_base=scale_base)
+        scales_t = torch.from_numpy(scales).to(device="cuda", dtype=torch.float32)
+        quats_t = torch.from_numpy(quats).to(device="cuda", dtype=torch.float32)
+        viewmat = torch.from_numpy(np.linalg.inv(pose).astype(np.float32)).to(device="cuda").unsqueeze(0)
+        Ks = torch.from_numpy(K).to(device="cuda", dtype=torch.float32).unsqueeze(0)
+        background = torch.full(
+            (1, 3),
+            float(self.output_config.render_background_gray) / 255.0,
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        render_colors, _, _ = gsplat.rasterization(
+            means=means,
+            quats=quats_t,
+            scales=scales_t,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmat,
+            Ks=Ks,
+            width=int(w),
+            height=int(h),
+            near_plane=0.01,
+            far_plane=float(self.output_config.render_depth_window_m),
+            radius_clip=float(self.output_config.render_gsplat_radius_clip),
+            packed=True,
+            tile_size=int(self.output_config.render_gsplat_tile_size),
+            backgrounds=background,
+            render_mode="RGB",
+            rasterize_mode=str(self.output_config.render_gsplat_rasterize_mode),
+        )
+        render_np = render_colors.detach().float().cpu().numpy()
+        if render_np.ndim == 4:
+            render_np = render_np[0]
+        if render_np.ndim == 3 and render_np.shape[0] == 3:
+            render_np = np.transpose(render_np, (1, 2, 0))
+        render_np = np.clip(render_np, 0.0, 1.0)
+        render_u8 = (255.0 * render_np).astype(np.uint8)
+        return render_u8, projected_points
+
     def _view_aware_budget(
         self,
+        uv: np.ndarray | None,
+        canvas_shape: tuple[int, int] | None,
         depth: np.ndarray,
         radius_px: np.ndarray,
         unstable: np.ndarray,
@@ -242,15 +428,90 @@ class GaussianSplatRenderer:
         radius_term = np.clip(radius_px / max(1e-6, self.output_config.render_max_radius_px), 0.0, 1.0)
         provenance_weight = np.choose(np.clip(provenance, 0, 3), [0.4, 0.7, 1.0, 1.2]).astype(np.float32)
         source_weight = np.choose(np.clip(source, 0, 3), [0.4, 0.75, 0.65, 1.0]).astype(np.float32)
+        stability_term = 1.0 / (1.0 + np.clip(unstable, 0.0, 3.0))
         score = (
-            1.8 * unstable
-            + 0.8 * recentness
+            1.35 * stability_term
+            + 0.75 * recentness
             + 0.9 * near_term
             + 0.6 * radius_term
             + provenance_weight
             + 0.5 * source_weight
         ).astype(np.float32)
+        if uv is not None and canvas_shape is not None and uv.shape[0] == count:
+            covered_keep = self._coverage_aware_keep(
+                uv=uv,
+                canvas_shape=canvas_shape,
+                radius_px=radius_px,
+                depth=depth,
+                score=score,
+                budget=budget,
+            )
+            if covered_keep.shape[0] > 0:
+                return covered_keep
         keep = np.argpartition(score, -budget)[-budget:]
+        return keep[np.argsort(depth[keep])]
+
+    def _coverage_aware_keep(
+        self,
+        uv: np.ndarray,
+        canvas_shape: tuple[int, int],
+        radius_px: np.ndarray,
+        depth: np.ndarray,
+        score: np.ndarray,
+        budget: int,
+    ) -> np.ndarray:
+        h, w = canvas_shape
+        if budget <= 0 or h <= 0 or w <= 0:
+            return np.zeros((0,), dtype=np.int32)
+        finite = np.isfinite(uv).all(axis=1)
+        margin = np.clip(radius_px, self.output_config.render_min_radius_px, self.output_config.render_max_radius_px)
+        visible = finite
+        visible &= uv[:, 0] >= -margin
+        visible &= uv[:, 0] < float(w) + margin
+        visible &= uv[:, 1] >= -margin
+        visible &= uv[:, 1] < float(h) + margin
+        visible_idx = np.flatnonzero(visible)
+        if visible_idx.size == 0:
+            return np.zeros((0,), dtype=np.int32)
+
+        aspect = max(1e-6, float(w) / max(1.0, float(h)))
+        grid_cols = int(np.clip(np.sqrt(max(1, budget) * aspect), 8, 32))
+        grid_rows = int(np.clip(np.ceil(grid_cols / aspect), 4, 18))
+        quota = max(1, int(np.ceil(budget / max(1, grid_cols * grid_rows))))
+
+        uv_visible = uv[visible_idx]
+        cell_x = np.clip((uv_visible[:, 0] * grid_cols / max(1.0, float(w))).astype(np.int32), 0, grid_cols - 1)
+        cell_y = np.clip((uv_visible[:, 1] * grid_rows / max(1.0, float(h))).astype(np.int32), 0, grid_rows - 1)
+        cells = cell_y * grid_cols + cell_x
+        order = np.argsort(-score[visible_idx])
+        selected: list[int] = []
+        selected_mask = np.zeros((score.shape[0],), dtype=bool)
+        cell_counts: dict[int, int] = {}
+
+        for local_idx in order:
+            global_idx = int(visible_idx[local_idx])
+            cell = int(cells[local_idx])
+            if cell_counts.get(cell, 0) >= quota:
+                continue
+            selected.append(global_idx)
+            selected_mask[global_idx] = True
+            cell_counts[cell] = cell_counts.get(cell, 0) + 1
+            if len(selected) >= budget:
+                break
+
+        if len(selected) < budget:
+            for local_idx in order:
+                global_idx = int(visible_idx[local_idx])
+                if selected_mask[global_idx]:
+                    continue
+                selected.append(global_idx)
+                selected_mask[global_idx] = True
+                if len(selected) >= budget:
+                    break
+
+        keep = np.array(selected, dtype=np.int32)
+        if keep.size == 0:
+            return keep
         return keep[np.argsort(depth[keep])]
 
     def _render_tiled(
@@ -392,6 +653,76 @@ class GaussianSplatRenderer:
     def _world_vec_to_camera(self, camera_pose: np.ndarray, xyz_world_vec: np.ndarray) -> np.ndarray:
         w2c = np.linalg.inv(camera_pose)[:3, :3].astype(np.float32)
         return xyz_world_vec @ w2c.T
+
+    def _axes_to_gsplat_params(
+        self,
+        axis_u: np.ndarray,
+        axis_v: np.ndarray,
+        scale_base: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        count = int(axis_u.shape[0])
+        scales = np.zeros((count, 3), dtype=np.float32)
+        quats = np.zeros((count, 4), dtype=np.float32)
+        for idx in range(count):
+            u = axis_u[idx]
+            v = axis_v[idx]
+            su = max(1e-4, float(np.linalg.norm(u)))
+            sv = max(1e-4, float(np.linalg.norm(v)))
+            u_dir = u / su
+            v_proj = v - np.dot(v, u_dir) * u_dir
+            sv_proj = max(1e-4, float(np.linalg.norm(v_proj)))
+            v_dir = v_proj / sv_proj
+            n_dir = np.cross(u_dir, v_dir).astype(np.float32)
+            n_norm = float(np.linalg.norm(n_dir))
+            if not np.isfinite(n_norm) or n_norm <= 1e-6:
+                n_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                n_dir = n_dir / n_norm
+            # Re-orthogonalize v against u/n to keep a stable rotation frame.
+            v_dir = np.cross(n_dir, u_dir).astype(np.float32)
+            v_dir /= max(1e-6, float(np.linalg.norm(v_dir)))
+            rot = np.stack([u_dir, v_dir, n_dir], axis=1).astype(np.float32)
+            quats[idx] = self._rotation_matrix_to_quaternion(rot)
+            scales[idx] = np.array(
+                [
+                    np.clip(su, 1e-4, self.output_config.render_max_radius_px),
+                    np.clip(max(sv, sv_proj), 1e-4, self.output_config.render_max_radius_px),
+                    np.clip(max(0.35 * float(scale_base[idx]), 1e-4), 1e-4, self.output_config.render_max_radius_px),
+                ],
+                dtype=np.float32,
+            )
+        return scales, quats
+
+    def _rotation_matrix_to_quaternion(self, rot: np.ndarray) -> np.ndarray:
+        m = rot.astype(np.float32)
+        trace = float(np.trace(m))
+        if trace > 0.0:
+            s = np.sqrt(trace + 1.0) * 2.0
+            w = 0.25 * s
+            x = (m[2, 1] - m[1, 2]) / s
+            y = (m[0, 2] - m[2, 0]) / s
+            z = (m[1, 0] - m[0, 1]) / s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+        quat = np.array([w, x, y, z], dtype=np.float32)
+        quat /= max(1e-6, float(np.linalg.norm(quat)))
+        return quat
 
     def _project_screen_axes(
         self,

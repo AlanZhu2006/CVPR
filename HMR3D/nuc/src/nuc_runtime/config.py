@@ -67,6 +67,10 @@ class MemoryConfig:
     enable_incremental_gaussian: bool = False
     enable_local_surface_volume: bool = True
     enable_semantic_like_region_filter: bool = True
+    enable_lingbot_style_sky_mask: bool = True
+    enable_structured_gaussian_init: bool = True
+    gaussian_stream_keyframe_interval: int = 2
+    gaussian_stream_optimize_interval: int = 2
     gaussian_min_pair_matches: int = 24
     gaussian_max_points_per_pair: int = 96
     gaussian_reproj_error_px: float = 3.0
@@ -106,12 +110,19 @@ class MemoryConfig:
     gaussian_local_volume_thin_cell_px: int = 10
     gaussian_local_volume_thin_max_layers: int = 1
     gaussian_local_volume_thin_depth_gap_m: float = 0.12
+    gaussian_structured_anchor_voxel_size: float = 0.28
+    gaussian_structured_min_points_per_anchor: int = 6
+    gaussian_structured_max_points: int = 1200
+    gaussian_structured_anisotropy_gain: float = 1.6
     gaussian_region_sky_top_ratio: float = 0.46
     gaussian_region_far_depth_m: float = 28.0
     gaussian_region_low_confidence_threshold: float = 0.22
     gaussian_region_vegetation_texture_scale: float = 2.4
     gaussian_region_dynamic_min_depth_m: float = 2.0
     gaussian_region_dynamic_max_depth_m: float = 18.0
+    gaussian_sky_brightness_threshold: float = 96.0
+    gaussian_sky_gradient_threshold: float = 18.0
+    gaussian_sky_far_depth_m: float = 24.0
     gaussian_optimize_topk: int = 6000
     gaussian_optimize_error_threshold: float = 20.0
     gaussian_optimize_unstable_decay: float = 0.88
@@ -120,6 +131,18 @@ class MemoryConfig:
     gaussian_optimize_depth_weight: float = 1.15
     gaussian_optimize_depth_score_weight: float = 0.85
     gaussian_optimize_depth_gate_m: float = 2.5
+    gaussian_optimize_fast_refine_mode: bool = False
+    gaussian_optimize_candidate_error_ratio: float = 0.6
+    gaussian_optimize_candidate_recentness_floor: float = 0.16
+    gaussian_optimize_candidate_unstable_floor: float = 0.35
+    gaussian_optimize_recovered_source_boost: float = 0.9
+    gaussian_optimize_structured_source_boost: float = 0.55
+    gaussian_optimize_pair_source_boost: float = 0.25
+    gaussian_optimize_depth_candidate_boost: float = 0.45
+    gaussian_optimize_recover_refine_frames: int = 4
+    gaussian_optimize_recover_extra_topk: int = 240
+    gaussian_optimize_recover_structured_bonus: float = 0.45
+    gaussian_optimize_recover_recentness_bonus: float = 0.25
     gaussian_coarse_voxel_size: float = 0.45
     gaussian_coarse_max_points: int = 1800
     gaussian_full_recent_archives: int = 2
@@ -128,6 +151,7 @@ class MemoryConfig:
 @dataclass
 class OutputConfig:
     output_dir: str = "nuc_output/default_run"
+    render_backend: str = "cpu"
     render_save_images: bool = True
     render_compare_stride: int = 10
     render_max_archived_submaps: int = 8
@@ -147,6 +171,9 @@ class OutputConfig:
     render_view_budget_points: int = 14000
     render_surface_depth_sigma: float = 0.35
     render_surface_opacity_gain: float = 1.15
+    render_gsplat_tile_size: int = 16
+    render_gsplat_radius_clip: float = 0.0
+    render_gsplat_rasterize_mode: str = "classic"
 
 
 @dataclass

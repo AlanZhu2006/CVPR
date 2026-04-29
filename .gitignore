@@ -1,16 +1,22 @@
-# Workspace-local environments and build artifacts
-GS_Console/
-cuVSLAM/.venv-jetson/
-cuVSLAM/build/
-cuVSLAM/outputs/
-HMR3D/nuc_output/
-
-# Nested repositories should be copied as plain files only
-**/.git/
-
-# Large local datasets / generated maps
-cuVSLAM/examples/kitti/dataset/sequences/06/map/data.mdb
+# Local editor noise
+.vscode/
+.DS_Store
 
 # Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+
+# Large local datasets and generated artifacts
+datasets/
+nuc_output/
+HMR3D/nuc_output/
+map.json
+
+# External dependencies and nested repos kept local
+cuVSLAM/
+third_party_research/
+
+# Common local model/checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
