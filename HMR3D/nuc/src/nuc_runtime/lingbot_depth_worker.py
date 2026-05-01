@@ -27,6 +27,9 @@ class LingBotDepthWorkerConfig:
     max_queue: int = 4
     force_cpu: bool = False
     offload_to_cpu: bool = True
+    enable_camera: bool = False
+    enable_depth: bool = True
+    enable_point: bool = False
     enable_3d_rope: bool = False
     depth_head_trt_engine: str = ""
     model_patch_embed: str = ""
@@ -35,6 +38,8 @@ class LingBotDepthWorkerConfig:
     model_num_heads: int = 0
     model_mlp_ratio: float = 0.0
     compress_outputs: bool = True
+    preload_model: bool = False
+    warmup_first_window: bool = False
 
 
 @dataclass
@@ -61,7 +66,7 @@ class LingBotWindowResult:
 
 
 class LingBotDepthWorker:
-    """Persistent LingBot depth-only worker for slow background mapping.
+    """Persistent LingBot worker for slow background mapping.
 
     The model is loaded once in a worker thread. The foreground tracking loop can
     submit frames quickly; the worker consumes overlapping windows and writes one
@@ -189,9 +194,9 @@ class LingBotDepthWorker:
             camera_num_iterations=self.config.camera_num_iterations,
             offload_to_cpu=self.config.offload_to_cpu,
             force_cpu=self.config.force_cpu,
-            enable_camera=False,
-            enable_depth=True,
-            enable_point=False,
+            enable_camera=self.config.enable_camera,
+            enable_depth=self.config.enable_depth,
+            enable_point=self.config.enable_point,
             enable_3d_rope=self.config.enable_3d_rope,
             depth_head_trt_engine=self.config.depth_head_trt_engine or None,
             model_patch_embed=self.config.model_patch_embed,
@@ -200,6 +205,8 @@ class LingBotDepthWorker:
             model_num_heads=self.config.model_num_heads,
             model_mlp_ratio=self.config.model_mlp_ratio,
         )
+        if self.config.preload_model:
+            reconstructor.preload()
         while True:
             payload = self._queue.get()
             if payload is None:
@@ -223,7 +230,7 @@ class LingBotDepthWorker:
         frame_metadata = [frame.get("metadata") or {} for frame in frames]
         queued_monotonic = float(payload.get("queued_monotonic_sec") or 0.0)
         metadata = {
-            "source": "lingbot_depth_worker",
+            "source": "lingbot_worker",
             "window_index": index,
             "frames": frames,
             "frame_indices": [frame.get("frame_idx") for frame in frames],
@@ -238,6 +245,8 @@ class LingBotDepthWorker:
             values = [item.get(key) for item in frame_metadata]
             if any(value is not None for value in values):
                 metadata[key + "s"] = values
+        if index == 0 and self.config.warmup_first_window:
+            reconstructor.run_on_image_paths(image_paths)
         start = time.perf_counter()
         bundle = reconstructor.export_bundle(
             image_paths,

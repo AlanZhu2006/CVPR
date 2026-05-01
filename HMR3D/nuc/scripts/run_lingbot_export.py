@@ -19,16 +19,31 @@ def parse_args() -> argparse.Namespace:
         description="Run LingBot reconstruction on an image folder and export predictions."
     )
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--lingbot-map-root", default="")
     parser.add_argument("--image-folder", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--first-k", type=int, default=2)
     parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--image-size", type=int, default=518)
+    parser.add_argument("--model-image-size", type=int, default=0)
+    parser.add_argument("--patch-size", type=int, default=14)
+    parser.add_argument("--mode", choices=["streaming", "windowed"], default="streaming")
+    parser.add_argument("--num-scale-frames", type=int, default=8)
+    parser.add_argument("--keyframe-interval", type=int, default=1)
+    parser.add_argument("--camera-num-iterations", type=int, default=1)
+    parser.add_argument("--no-offload-to-cpu", action="store_true")
+    parser.add_argument("--disable-camera", action="store_true")
+    parser.add_argument("--disable-point", action="store_true")
     parser.add_argument("--force-cpu", action="store_true", default=False)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.lingbot_map_root:
+        import os
+
+        os.environ["LINGBOT_MAP_ROOT"] = str(Path(args.lingbot_map_root).expanduser().resolve())
     image_paths = sorted(
         str(path)
         for path in Path(args.image_folder).expanduser().resolve().iterdir()
@@ -41,9 +56,17 @@ def main() -> None:
 
     reconstructor = LingBotReconstructor(
         model_path=args.model_path,
+        image_size=args.image_size,
+        model_image_size=args.model_image_size or None,
+        patch_size=args.patch_size,
+        mode=args.mode,
+        num_scale_frames=args.num_scale_frames,
+        keyframe_interval=args.keyframe_interval,
+        camera_num_iterations=args.camera_num_iterations,
+        offload_to_cpu=not args.no_offload_to_cpu,
+        enable_camera=not args.disable_camera,
+        enable_point=not args.disable_point,
         force_cpu=args.force_cpu,
-        camera_num_iterations=1,
-        keyframe_interval=1,
     )
     bundle = reconstructor.export_bundle(
         image_paths=image_paths,

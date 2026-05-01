@@ -132,6 +132,9 @@ class LingBotReconstructor:
     def device(self) -> torch.device:
         return self._device
 
+    def preload(self) -> None:
+        self._load_model()
+
     def _build_args(self) -> SimpleNamespace:
         return SimpleNamespace(
             mode=self.mode,

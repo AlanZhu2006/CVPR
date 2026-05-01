@@ -85,6 +85,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-queue", type=int, default=4)
     parser.add_argument("--force-cpu", action="store_true")
     parser.add_argument("--no-offload-to-cpu", action="store_true")
+    parser.add_argument("--enable-camera", action="store_true")
+    parser.add_argument("--disable-depth", action="store_true")
+    parser.add_argument("--enable-point", action="store_true")
     parser.add_argument("--enable-3d-rope", action="store_true")
     parser.add_argument("--depth-head-trt-engine", default="", help="Optional fixed-shape TensorRT DPT depth-head engine.")
     parser.add_argument("--model-patch-embed", default="", help="Direct GCTStream patch embed override, e.g. conv for tiny students.")
@@ -93,6 +96,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-num-heads", type=int, default=0)
     parser.add_argument("--model-mlp-ratio", type=float, default=0.0)
     parser.add_argument("--no-compress-output", action="store_true")
+    parser.add_argument("--preload-model", action="store_true")
+    parser.add_argument("--warmup-first-window", action="store_true")
     parser.add_argument("--submit-blocking", action="store_true")
     return parser.parse_args()
 
@@ -126,6 +131,9 @@ def main() -> int:
         max_queue=args.max_queue,
         force_cpu=args.force_cpu,
         offload_to_cpu=not args.no_offload_to_cpu,
+        enable_camera=args.enable_camera,
+        enable_depth=not args.disable_depth,
+        enable_point=args.enable_point,
         enable_3d_rope=args.enable_3d_rope,
         depth_head_trt_engine=args.depth_head_trt_engine,
         model_patch_embed=args.model_patch_embed,
@@ -134,6 +142,8 @@ def main() -> int:
         model_num_heads=args.model_num_heads,
         model_mlp_ratio=args.model_mlp_ratio,
         compress_outputs=not args.no_compress_output,
+        preload_model=args.preload_model,
+        warmup_first_window=args.warmup_first_window,
     )
     worker = LingBotDepthWorker(config)
     started = time.perf_counter()
@@ -167,8 +177,9 @@ def main() -> int:
         }
     )
     summary_path = Path(args.output_dir).expanduser().resolve() / "worker_run_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(json.dumps(summary, indent=2))
+    summary_text = json.dumps(summary, indent=2)
+    summary_path.write_text(summary_text, encoding="utf-8")
+    print(summary_text)
     return 0 if summary.get("failed_windows", 0) == 0 else 2
 
 

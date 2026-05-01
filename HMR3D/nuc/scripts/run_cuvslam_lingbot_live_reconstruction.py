@@ -91,6 +91,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-scale-frames", type=int, default=2)
     parser.add_argument("--max-queue", type=int, default=2)
     parser.add_argument("--depth-scale", type=float, default=20.0)
+    parser.add_argument(
+        "--lingbot-pose-translation-scale",
+        type=float,
+        default=0.0,
+        help="Scale LingBot-predicted camera translations before fusing depth. 0 follows --depth-scale.",
+    )
     parser.add_argument("--min-depth", type=float, default=0.1)
     parser.add_argument("--max-depth", type=float, default=80.0)
     parser.add_argument("--min-conf", type=float, default=1.0)
@@ -298,6 +304,19 @@ def _backproject(K: np.ndarray, pose: np.ndarray, xs: np.ndarray, ys: np.ndarray
     y_cam = (ys.astype(np.float32) - cy) * z / max(fy, 1e-6)
     camera = np.stack([x_cam, y_cam, z], axis=1).astype(np.float32)
     return (camera @ pose[:3, :3].T + pose[:3, 3]).astype(np.float32)
+
+
+def _lingbot_extrinsic_to_pose(extrinsic: np.ndarray, translation_scale: float = 1.0) -> np.ndarray | None:
+    extrinsic = np.asarray(extrinsic, dtype=np.float32)
+    if extrinsic.shape == (3, 4):
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, :4] = extrinsic
+    elif extrinsic.shape == (4, 4):
+        pose = extrinsic.astype(np.float32).copy()
+    else:
+        return None
+    pose[:3, 3] *= float(translation_scale)
+    return pose
 
 
 def _grid_pixels(height: int, width: int, stride: int) -> tuple[np.ndarray, np.ndarray]:
@@ -528,6 +547,9 @@ def _write_live_json(
             "color_image_dir": str(args.color_image_dir),
             "color_image_template": str(args.color_image_template),
             "depth_scale": float(args.depth_scale),
+            "lingbot_pose_translation_scale": float(
+                getattr(args, "lingbot_pose_translation_scale", 0.0) or getattr(args, "depth_scale", 1.0)
+            ),
             "sample_stride": int(args.sample_stride),
             "max_points_per_frame": int(args.max_points_per_frame),
             "fusion_mode": str(getattr(args, "fusion_mode", "raw")),
@@ -703,18 +725,29 @@ def _process_worker_result(
     pred = np.load(pred_path)
     depth = _squeeze_depth(pred["depth"])
     conf = _squeeze_depth(pred["depth_conf"]) if "depth_conf" in pred else np.ones_like(depth, dtype=np.float32)
+    lingbot_extrinsic = np.asarray(pred["extrinsic"], dtype=np.float32) if "extrinsic" in pred else None
+    lingbot_intrinsic = np.asarray(pred["intrinsic"], dtype=np.float32) if "intrinsic" in pred else None
+    lingbot_translation_scale = float(
+        getattr(args, "lingbot_pose_translation_scale", 0.0) or getattr(args, "depth_scale", 1.0)
+    )
     frames = summary.get("metadata", {}).get("frames", [])
     updated = 0
     total_points = 0
     for local_idx, frame in enumerate(frames[: depth.shape[0]]):
         meta = frame.get("metadata") or {}
-        if "pose" not in meta:
-            continue
         frame_idx = int(frame.get("frame_idx", local_idx))
+        pose = None
+        if "pose" in meta:
+            pose = np.asarray(meta["pose"], dtype=np.float32)
+        elif frame_idx in trajectory_by_frame and "pose" in trajectory_by_frame[frame_idx]:
+            pose = np.asarray(trajectory_by_frame[frame_idx]["pose"], dtype=np.float32)
+        elif lingbot_extrinsic is not None and local_idx < lingbot_extrinsic.shape[0]:
+            pose = _lingbot_extrinsic_to_pose(lingbot_extrinsic[local_idx], translation_scale=lingbot_translation_scale)
+        if pose is None:
+            continue
         image_path = str(frame.get("image_path", ""))
         color_image_path = _resolve_color_image_path(args, frame_idx)
         sample_image_path = color_image_path or image_path
-        pose = np.asarray(meta["pose"], dtype=np.float32)
         original_shape = tuple(meta.get("frame_shape", [0, 0]))
         if len(original_shape) != 2 or original_shape[0] <= 0:
             rgb_probe = _load_rgb(sample_image_path)
@@ -722,7 +755,10 @@ def _process_worker_result(
             rgb = rgb_probe
         else:
             rgb = _load_rgb(sample_image_path)
-        K = _scaled_intrinsic(K_base, (int(original_shape[0]), int(original_shape[1])), depth[local_idx].shape)
+        if lingbot_intrinsic is not None and local_idx < lingbot_intrinsic.shape[0]:
+            K = np.asarray(lingbot_intrinsic[local_idx], dtype=np.float32)
+        else:
+            K = _scaled_intrinsic(K_base, (int(original_shape[0]), int(original_shape[1])), depth[local_idx].shape)
         sampled = _sample_frame_points(
             depth=depth[local_idx],
             conf=conf[local_idx],
@@ -949,6 +985,7 @@ def main() -> int:
                 "frame_idx": int(item.frame_idx),
                 "timestamp_sec": float(item.timestamp_sec),
                 "position": pose[:3, 3].astype(float).tolist(),
+                "pose": pose.astype(float).tolist(),
                 "is_keyframe": bool(item.is_keyframe),
                 "track_ok": bool(item.track_ok),
             }
