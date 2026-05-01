@@ -1,0 +1,4 @@
+[submodule "third_party_research/lingbot-map"]
+	path = third_party_research/lingbot-map
+	url = https://github.com/AlanZhu2006/lingbot-map.git
+	branch = cvpr/local-base

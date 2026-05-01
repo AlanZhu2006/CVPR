@@ -5,6 +5,7 @@
 # Python cache
 __pycache__/
 *.py[cod]
+.venv*/
 
 # Large local datasets and generated artifacts
 datasets/
@@ -12,9 +13,11 @@ nuc_output/
 HMR3D/nuc_output/
 map.json
 
-# External dependencies and nested repos kept local
+# External dependencies kept local
 cuVSLAM/
-third_party_research/
+third_party_research/lingbot_cache/
+third_party_research/lingbot-map/**/__pycache__/
+third_party_research/lingbot-map/**/*.py[cod]
 
 # Common local model/checkpoint artifacts
 *.pt

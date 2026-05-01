@@ -56,7 +56,7 @@ Why it is not visually as clean as the official LingBot church demo:
 Useful local viewers from that run:
 
 ```bash
-/home/nyu/Codespace/CVPR/cuVSLAM/.venv-jetson/bin/python \
+cuVSLAM/.venv-jetson/bin/python \
   HMR3D/nuc/scripts/launch_lingbot_live_viser.py \
   --map-dir nuc_output/lingbot_church_cuvslam_student/church80_student_depth8_voxel4cm \
   --host 0.0.0.0 \
@@ -78,7 +78,7 @@ After pulling this repository on the 16GB machine, first test the full LingBot
 teacher on the bundled `church` images:
 
 ```bash
-cd /home/nyu/Codespace/CVPR
+cd /home/nvidia/twork/lingbot-map/CVPR
 
 MODEL_PATH=/path/to/lingbot-map.pt \
 FIRST_K=20 \
@@ -97,7 +97,7 @@ http://127.0.0.1:19115
 For a remote browser:
 
 ```bash
-ssh -L 19115:127.0.0.1:19115 nyu@<orin-host>
+ssh -L 19115:127.0.0.1:19115 nvidia@<orin-host>
 ```
 
 If `FIRST_K=20` is stable, increase in this order:
