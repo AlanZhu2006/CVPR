@@ -97,6 +97,15 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Scale LingBot-predicted camera translations before fusing depth. 0 follows --depth-scale.",
     )
+    parser.add_argument(
+        "--lingbot-extrinsic-mode",
+        choices=("inverse", "direct"),
+        default="inverse",
+        help=(
+            "How to interpret LingBot predictions.extrinsic when no external pose is available. "
+            "inverse matches the official depth unprojection path where extrinsic is world-to-camera."
+        ),
+    )
     parser.add_argument("--min-depth", type=float, default=0.1)
     parser.add_argument("--max-depth", type=float, default=80.0)
     parser.add_argument("--min-conf", type=float, default=1.0)
@@ -306,15 +315,25 @@ def _backproject(K: np.ndarray, pose: np.ndarray, xs: np.ndarray, ys: np.ndarray
     return (camera @ pose[:3, :3].T + pose[:3, 3]).astype(np.float32)
 
 
-def _lingbot_extrinsic_to_pose(extrinsic: np.ndarray, translation_scale: float = 1.0) -> np.ndarray | None:
+def _lingbot_extrinsic_to_pose(
+    extrinsic: np.ndarray,
+    translation_scale: float = 1.0,
+    mode: str = "inverse",
+) -> np.ndarray | None:
     extrinsic = np.asarray(extrinsic, dtype=np.float32)
     if extrinsic.shape == (3, 4):
-        pose = np.eye(4, dtype=np.float32)
-        pose[:3, :4] = extrinsic
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[:3, :4] = extrinsic
     elif extrinsic.shape == (4, 4):
-        pose = extrinsic.astype(np.float32).copy()
+        matrix = extrinsic.astype(np.float32).copy()
     else:
         return None
+    if mode == "inverse":
+        pose = np.linalg.inv(matrix).astype(np.float32)
+    elif mode == "direct":
+        pose = matrix.astype(np.float32).copy()
+    else:
+        raise ValueError(f"Unknown LingBot extrinsic mode: {mode}")
     pose[:3, 3] *= float(translation_scale)
     return pose
 
@@ -550,6 +569,7 @@ def _write_live_json(
             "lingbot_pose_translation_scale": float(
                 getattr(args, "lingbot_pose_translation_scale", 0.0) or getattr(args, "depth_scale", 1.0)
             ),
+            "lingbot_extrinsic_mode": str(getattr(args, "lingbot_extrinsic_mode", "inverse")),
             "sample_stride": int(args.sample_stride),
             "max_points_per_frame": int(args.max_points_per_frame),
             "fusion_mode": str(getattr(args, "fusion_mode", "raw")),
@@ -742,7 +762,11 @@ def _process_worker_result(
         elif frame_idx in trajectory_by_frame and "pose" in trajectory_by_frame[frame_idx]:
             pose = np.asarray(trajectory_by_frame[frame_idx]["pose"], dtype=np.float32)
         elif lingbot_extrinsic is not None and local_idx < lingbot_extrinsic.shape[0]:
-            pose = _lingbot_extrinsic_to_pose(lingbot_extrinsic[local_idx], translation_scale=lingbot_translation_scale)
+            pose = _lingbot_extrinsic_to_pose(
+                lingbot_extrinsic[local_idx],
+                translation_scale=lingbot_translation_scale,
+                mode=getattr(args, "lingbot_extrinsic_mode", "inverse"),
+            )
         if pose is None:
             continue
         image_path = str(frame.get("image_path", ""))
@@ -1121,6 +1145,7 @@ def main() -> int:
             "fusion_max_points": int(args.fusion_max_points),
             "fusion_min_observations": int(args.fusion_min_observations),
             "adaptive_sampling": bool(args.adaptive_sampling),
+            "lingbot_extrinsic_mode": str(args.lingbot_extrinsic_mode),
             "sample_stride": int(args.sample_stride),
             "near_sample_stride": int(args.near_sample_stride),
             "edge_sample_stride": int(args.edge_sample_stride),

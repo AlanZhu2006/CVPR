@@ -45,6 +45,15 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Scale LingBot-predicted camera translations before fusing depth. 0 follows --depth-scale.",
     )
+    parser.add_argument(
+        "--lingbot-extrinsic-mode",
+        choices=("inverse", "direct"),
+        default="inverse",
+        help=(
+            "How to interpret LingBot predictions.extrinsic. inverse matches the official "
+            "depth unprojection path where extrinsic is world-to-camera."
+        ),
+    )
     parser.add_argument("--rgb-image-dir", default="")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--frame-step", type=int, default=1)
@@ -99,6 +108,7 @@ def _build_chained_lingbot_trajectory(
     *,
     live_module: Any,
     translation_scale: float,
+    extrinsic_mode: str,
 ) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[str, Any]]:
     trajectory_by_frame: dict[int, dict[str, Any]] = {}
     disconnected_windows = 0
@@ -121,6 +131,7 @@ def _build_chained_lingbot_trajectory(
             pose = live_module._lingbot_extrinsic_to_pose(
                 extrinsics[local_idx],
                 translation_scale=translation_scale,
+                mode=extrinsic_mode,
             )
             if pose is None:
                 continue
@@ -167,6 +178,7 @@ def _build_chained_lingbot_trajectory(
         "trajectory_frames": int(len(trajectory)),
         "disconnected_windows": int(disconnected_windows),
         "translation_scale": float(translation_scale),
+        "extrinsic_mode": str(extrinsic_mode),
     }
     return trajectory, trajectory_by_frame, stats
 
@@ -221,12 +233,14 @@ def main() -> int:
         "trajectory_frames": len(trajectory_by_frame),
         "disconnected_windows": 0,
         "translation_scale": lingbot_translation_scale,
+        "extrinsic_mode": str(args.lingbot_extrinsic_mode),
     }
     if args.lingbot_pose_mode == "chain_relative":
         trajectory, trajectory_by_frame, pose_stats = _build_chained_lingbot_trajectory(
             result_paths,
             live_module=live,
             translation_scale=lingbot_translation_scale,
+            extrinsic_mode=args.lingbot_extrinsic_mode,
         )
         if args.tracking_backend == "rebuild":
             args.tracking_backend = "lingbot_chain_relative"

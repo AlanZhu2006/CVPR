@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -58,6 +59,11 @@ def _import_lingbot_demo():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 @dataclass
@@ -216,15 +222,29 @@ class LingBotReconstructor:
         if not image_paths:
             raise ValueError("LingBotReconstructor requires at least one image path")
 
+        profile: dict[str, float] = {}
+        total_start = time.perf_counter()
+
+        load_start = time.perf_counter()
         model = self._load_model()
+        _sync_if_cuda(self.device)
+        profile["model_load_sec"] = time.perf_counter() - load_start
+
+        preprocess_start = time.perf_counter()
         images = self._demo.load_and_preprocess_images(
             image_paths,
             mode="crop",
             image_size=self.image_size,
             patch_size=self.patch_size,
         )
-        images = images.to(self.device)
+        profile["preprocess_sec"] = time.perf_counter() - preprocess_start
 
+        device_transfer_start = time.perf_counter()
+        images = images.to(self.device)
+        _sync_if_cuda(self.device)
+        profile["image_to_device_sec"] = time.perf_counter() - device_transfer_start
+
+        dtype_start = time.perf_counter()
         if self.device.type == "cuda":
             env_dtype = os.environ.get("LINGBOT_MODEL_DTYPE", "").strip().lower()
             if env_dtype in {"fp16", "float16", "half"}:
@@ -242,8 +262,12 @@ class LingBotReconstructor:
 
         if dtype != torch.float32 and getattr(model, "aggregator", None) is not None:
             model.aggregator = model.aggregator.to(dtype=dtype)
+        _sync_if_cuda(self.device)
+        profile["dtype_setup_sec"] = time.perf_counter() - dtype_start
 
         output_device = torch.device("cpu") if self.offload_to_cpu else None
+        _sync_if_cuda(self.device)
+        forward_start = time.perf_counter()
         with torch.no_grad():
             if self.device.type == "cuda":
                 autocast = torch.amp.autocast("cuda", dtype=dtype)
@@ -264,14 +288,24 @@ class LingBotReconstructor:
                         overlap_size=0,
                         output_device=output_device,
                     )
+        _sync_if_cuda(self.device)
+        profile["model_forward_sec"] = time.perf_counter() - forward_start
 
+        postprocess_start = time.perf_counter()
         predictions, _ = self._demo.postprocess(predictions, images)
+        _sync_if_cuda(self.device)
+        profile["postprocess_sec"] = time.perf_counter() - postprocess_start
+
+        numpy_start = time.perf_counter()
         predictions_np = {}
         for key, value in predictions.items():
             if isinstance(value, torch.Tensor):
                 predictions_np[key] = value.detach().cpu().numpy()
             elif isinstance(value, np.ndarray):
                 predictions_np[key] = value
+        _sync_if_cuda(self.device)
+        profile["tensor_to_numpy_sec"] = time.perf_counter() - numpy_start
+        profile["total_sec"] = time.perf_counter() - total_start
 
         summary = {
             "image_paths": image_paths,
@@ -297,7 +331,15 @@ class LingBotReconstructor:
             "model_load_missing_keys": self._model_load_missing,
             "model_load_unexpected_keys": self._model_load_unexpected,
             "prediction_keys": sorted(predictions_np.keys()),
+            "profile_sec": profile,
         }
+        if self.device.type == "cuda":
+            summary["cuda_memory"] = {
+                "allocated_gb": float(torch.cuda.memory_allocated(self.device) / (1024**3)),
+                "reserved_gb": float(torch.cuda.memory_reserved(self.device) / (1024**3)),
+                "max_allocated_gb": float(torch.cuda.max_memory_allocated(self.device) / (1024**3)),
+                "max_reserved_gb": float(torch.cuda.max_memory_reserved(self.device) / (1024**3)),
+            }
         if "depth" in predictions_np:
             summary["depth_shape"] = list(predictions_np["depth"].shape)
         if "world_points" in predictions_np:
@@ -320,11 +362,19 @@ class LingBotReconstructor:
             summary["metadata"] = metadata
 
         predictions_npz = output_dir / "lingbot_predictions.npz"
+        save_npz_start = time.perf_counter()
         if compress_outputs:
             np.savez_compressed(predictions_npz, **predictions_np)
         else:
             np.savez(predictions_npz, **predictions_np)
+        summary.setdefault("profile_sec", {})["save_npz_sec"] = time.perf_counter() - save_npz_start
         summary_json = output_dir / "lingbot_summary.json"
+        save_summary_start = time.perf_counter()
+        summary_json.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        summary["profile_sec"]["save_summary_json_sec"] = time.perf_counter() - save_summary_start
         summary_json.write_text(
             json.dumps(summary, indent=2, ensure_ascii=False),
             encoding="utf-8",

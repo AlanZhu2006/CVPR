@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import cv2
@@ -27,6 +28,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-depth", type=float, default=80.0)
     parser.add_argument("--max-points-per-frame", type=int, default=25000)
     parser.add_argument("--output-name", default="lingbot_dense_geometry.npz")
+    parser.add_argument(
+        "--geometry-source",
+        default="auto",
+        choices=["auto", "cuvslam", "lingbot_depth", "world_points"],
+        help=(
+            "Source used to build world points. auto preserves the old priority "
+            "order when cuVSLAM poses are present, then falls back to LingBot "
+            "world_points, then official LingBot depth+extrinsic unprojection."
+        ),
+    )
     parser.add_argument(
         "--pose-align",
         default="auto",
@@ -471,12 +482,16 @@ def _sample_depth_frame(
 
 def main() -> None:
     args = parse_args()
+    total_start = time.perf_counter()
+    profile: dict[str, float] = {}
     predictions_path = Path(args.predictions_npz).expanduser().resolve()
     summary_path = Path(args.summary_json).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    load_start = time.perf_counter()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     predictions = np.load(predictions_path)
+    profile["load_inputs_sec"] = time.perf_counter() - load_start
 
     if "depth" not in predictions:
         raise KeyError(f"{predictions_path} does not contain depth")
@@ -505,12 +520,43 @@ def main() -> None:
     lingbot_extrinsic = _pose_array(predictions["extrinsic"], frame_count) if "extrinsic" in predictions else None
     lingbot_pose_candidates = _pose_candidates(lingbot_extrinsic)
 
-    use_cuvslam = intrinsics is not None and cuvslam_poses.shape[0] >= frame_count
-    use_world_points = not use_cuvslam and world_points is not None
-    if not use_cuvslam and not use_world_points:
+    has_cuvslam = intrinsics is not None and cuvslam_poses.shape[0] >= frame_count
+    has_world_points = world_points is not None and world_points.shape[0] >= frame_count
+    has_lingbot_depth_pose = (
+        intrinsics is not None
+        and lingbot_extrinsic is not None
+        and lingbot_extrinsic.shape[0] >= frame_count
+    )
+
+    requested_geometry_source = str(args.geometry_source)
+    if requested_geometry_source == "auto":
+        use_cuvslam = has_cuvslam
+        use_world_points = (not use_cuvslam) and has_world_points
+        use_lingbot_depth = (not use_cuvslam) and (not use_world_points) and has_lingbot_depth_pose
+    else:
+        use_cuvslam = requested_geometry_source == "cuvslam"
+        use_world_points = requested_geometry_source == "world_points"
+        use_lingbot_depth = requested_geometry_source == "lingbot_depth"
+
+    missing_reason = ""
+    if use_cuvslam and not has_cuvslam:
+        missing_reason = "cuvslam requires predictions.intrinsic and summary.metadata.cuvslam_poses"
+    if use_world_points and not has_world_points:
+        missing_reason = "world_points requires predictions.world_points"
+    if use_lingbot_depth and not has_lingbot_depth_pose:
+        missing_reason = "lingbot_depth requires predictions.depth, predictions.intrinsic, and predictions.extrinsic"
+    if missing_reason:
+        raise RuntimeError(f"--geometry-source {requested_geometry_source} unavailable: {missing_reason}")
+    if not use_cuvslam and not use_world_points and not use_lingbot_depth:
         raise RuntimeError(
-            "Cannot build metric points: need intrinsic+cuvslam_poses or LingBot world_points"
+            "Cannot build metric points: need intrinsic+cuvslam_poses, LingBot world_points, "
+            "or LingBot intrinsic+extrinsic for official depth unprojection"
         )
+    lingbot_depth_poses = (
+        np.linalg.inv(lingbot_extrinsic).astype(np.float32)
+        if use_lingbot_depth and lingbot_extrinsic is not None
+        else None
+    )
 
     requested_depth_scale = _parse_depth_scale_arg(args.depth_scale)
     scale_fit = {"enabled": False, "scale": 1.0, "source": "identity", "valid_pairs": 0}
@@ -553,11 +599,14 @@ def main() -> None:
     image_paths = _resolve_image_paths(summary, summary_path, args.image_root)
     frame_arrays = []
     frame_stats = []
+    frame_loop_start = time.perf_counter()
     for local_idx in range(frame_count):
         rgb = _load_rgb(image_paths[local_idx] if local_idx < len(image_paths) else "")
-        K = intrinsics[local_idx] if use_cuvslam else None
+        K = intrinsics[local_idx] if (use_cuvslam or use_lingbot_depth) else None
         if use_cuvslam and aligned_lingbot_poses is not None and local_idx < aligned_lingbot_poses.shape[0]:
             pose = aligned_lingbot_poses[local_idx]
+        elif use_lingbot_depth and lingbot_depth_poses is not None and local_idx < lingbot_depth_poses.shape[0]:
+            pose = lingbot_depth_poses[local_idx]
         else:
             pose = cuvslam_poses[local_idx] if use_cuvslam else None
         pointmap = world_points[local_idx] if use_world_points else None
@@ -575,6 +624,7 @@ def main() -> None:
         frame_arrays.append(arrays)
         stats["image_path"] = image_paths[local_idx] if local_idx < len(image_paths) else ""
         frame_stats.append(stats)
+    profile["frame_sampling_sec"] = time.perf_counter() - frame_loop_start
 
     def concat(key: str) -> np.ndarray:
         values = [item[key] for item in frame_arrays]
@@ -608,7 +658,9 @@ def main() -> None:
         save_payload["cuvslam_poses"] = cuvslam_poses.astype(np.float32)
     if aligned_lingbot_poses is not None and aligned_lingbot_poses.shape[0] > 0:
         save_payload["aligned_lingbot_poses"] = aligned_lingbot_poses.astype(np.float32)
+    save_start = time.perf_counter()
     np.savez_compressed(dense_npz, **save_payload)
+    profile["save_npz_sec"] = time.perf_counter() - save_start
 
     pose_source = "predictions.world_points"
     coordinate_frame = "lingbot_world_points"
@@ -618,6 +670,9 @@ def main() -> None:
             pose_source = f"predictions.extrinsic[{pose_alignment['lingbot_pose_mode']}] aligned_to_cuvslam"
         else:
             pose_source = "summary.metadata.cuvslam_poses"
+    elif use_lingbot_depth:
+        coordinate_frame = "lingbot_depth_world"
+        pose_source = "inverse(predictions.extrinsic), matching official depth unprojection"
 
     dense_summary = {
         "schema_version": 1,
@@ -633,6 +688,10 @@ def main() -> None:
         "depth_scale_fit": scale_fit,
         "pose_alignment": pose_alignment,
         "stride": int(args.stride),
+        "geometry_source_requested": requested_geometry_source,
+        "geometry_source_resolved": (
+            "cuvslam" if use_cuvslam else "lingbot_depth" if use_lingbot_depth else "world_points"
+        ),
         "min_conf": float(args.min_conf),
         "min_depth": float(args.min_depth),
         "max_depth": float(args.max_depth),
@@ -641,7 +700,9 @@ def main() -> None:
         "pose_source": pose_source,
         "frame_stats": frame_stats,
         "npz_keys": sorted(save_payload.keys()),
+        "profile_sec": profile,
     }
+    dense_summary["profile_sec"]["total_sec"] = time.perf_counter() - total_start
     dense_summary_path = output_dir / "lingbot_dense_geometry_summary.json"
     dense_summary_path.write_text(
         json.dumps(dense_summary, indent=2, ensure_ascii=False),

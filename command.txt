@@ -44,3 +44,66 @@ http://127.0.0.1:9090/kitti06_v4_gaussian_live_800_viewer.html
 http://127.0.0.1:19090/gsconsole_compare_viewer.html
 
 source /home/nyu/Codespace/CVPR/HMR3D/nuc/scripts/use_jetson_gpu_backend.sh
+
+
+
+cd /home/nvidia/twork/lingbot-map/CVPR
+source /opt/ros/humble/setup.bash
+
+python3 HMR3D/nuc/scripts/publish_lingbot_live_map_ros2.py \
+  --map-dir /home/nvidia/twork/lingbot-map/CVPR/nuc_output/lingbot_full_teacher_worker/courthouse_full_224_fast_chain_live_map \
+  --topic /lingbot/cloud \
+  --frame-id map \
+  --mode reveal \
+  --fps 4 \
+  --max-points 250000 \
+  --loop
+
+
+cd /home/nvidia/twork/lingbot-map/CVPR
+source /opt/ros/humble/setup.bash
+
+rviz2 -d /home/nvidia/twork/lingbot-map/CVPR/HMR3D/nuc/configs/lingbot_cloud.rviz
+
+cd /home/nvidia/twork/lingbot-map/CVPR
+source /opt/ros/humble/setup.bash
+source HMR3D/nuc/scripts/use_jetson_gpu_backend.sh
+
+# LingBot fast path on Jetson Orin:
+# - image_size controls the preprocessed input resolution.
+# - model_image_size keeps the checkpoint/model pos_embed at 518.
+# First --compile run spends a few minutes warming/compiling, then streams faster.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export FLASHINFER_CUDA_ARCH_LIST="8.7"
+export LINGBOT_LOAD_CHECKPOINT_ON_CPU=1
+export LINGBOT_CHECKPOINT_MMAP=1
+export LINGBOT_MODEL_DTYPE=fp16
+export LINGBOT_CPU_CAST_BEFORE_CUDA=1
+export LINGBOT_CPU_CAST_SCOPE=model
+
+python /home/nvidia/twork/lingbot-map/CVPR/third_party_research/lingbot-map/demo.py \
+  --model_path /home/nvidia/twork/lingbot-map/CVPR/third_party_research/lingbot_cache/lingbot-map.pt \
+  --image_folder /home/nvidia/twork/lingbot-map/CVPR/third_party_research/lingbot-map/example/courthouse \
+  --first_k 20 \
+  --image_size 336 \
+  --model_image_size 518 \
+  --mode streaming \
+  --keyframe_interval 2 \
+  --camera_num_iterations 1 \
+  --compile \
+  --offload_to_cpu \
+  --port 18090
+
+# SDPA fallback if FlashInfer/compile is too slow to warm up:
+python /home/nvidia/twork/lingbot-map/CVPR/third_party_research/lingbot-map/demo.py \
+  --model_path /home/nvidia/twork/lingbot-map/CVPR/third_party_research/lingbot_cache/lingbot-map.pt \
+  --image_folder /home/nvidia/twork/lingbot-map/CVPR/third_party_research/lingbot-map/example/courthouse \
+  --first_k 20 \
+  --image_size 336 \
+  --model_image_size 518 \
+  --mode streaming \
+  --keyframe_interval 2 \
+  --camera_num_iterations 1 \
+  --use_sdpa \
+  --offload_to_cpu \
+  --port 18090
