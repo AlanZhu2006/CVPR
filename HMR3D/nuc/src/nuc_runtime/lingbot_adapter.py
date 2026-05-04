@@ -66,6 +66,25 @@ def _sync_if_cuda(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _cpu_postprocess_without_camera(
+    demo_module,
+    predictions: dict[str, Any],
+    images: torch.Tensor,
+) -> tuple[dict[str, Any], torch.Tensor]:
+    """Move depth-only/point-only LingBot outputs to CPU without pose decoding."""
+    predictions.pop("pose_enc_list", None)
+    predictions.pop("images", None)
+    squeeze_single_batch = getattr(demo_module, "_squeeze_single_batch", lambda _key, value: value)
+    for key in list(predictions.keys()):
+        value = predictions[key]
+        if isinstance(value, torch.Tensor):
+            predictions[key] = squeeze_single_batch(key, value.to("cpu", non_blocking=True))
+    images_cpu = images.to("cpu", non_blocking=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return predictions, images_cpu
+
+
 @dataclass
 class LingBotReconBundle:
     image_paths: list[str]
@@ -85,7 +104,7 @@ class LingBotReconstructor:
         num_scale_frames: int = 8,
         keyframe_interval: int = 1,
         camera_num_iterations: int = 1,
-        use_sdpa: bool = True,
+        use_sdpa: bool = False,
         offload_to_cpu: bool = True,
         force_cpu: bool = True,
         enable_camera: bool = True,
@@ -127,6 +146,7 @@ class LingBotReconstructor:
         self._depth_head_backend = "torch"
         self._model_load_missing = 0
         self._model_load_unexpected = 0
+        self._aggregator_dtype: str | None = None
 
         self._demo = _import_lingbot_demo()
         self._device = torch.device(
@@ -260,8 +280,14 @@ class LingBotReconstructor:
         else:
             dtype = torch.float32
 
-        if dtype != torch.float32 and getattr(model, "aggregator", None) is not None:
+        dtype_key = str(dtype)
+        if (
+            dtype != torch.float32
+            and getattr(model, "aggregator", None) is not None
+            and self._aggregator_dtype != dtype_key
+        ):
             model.aggregator = model.aggregator.to(dtype=dtype)
+            self._aggregator_dtype = dtype_key
         _sync_if_cuda(self.device)
         profile["dtype_setup_sec"] = time.perf_counter() - dtype_start
 
@@ -292,7 +318,10 @@ class LingBotReconstructor:
         profile["model_forward_sec"] = time.perf_counter() - forward_start
 
         postprocess_start = time.perf_counter()
-        predictions, _ = self._demo.postprocess(predictions, images)
+        if "pose_enc" in predictions:
+            predictions, _ = self._demo.postprocess(predictions, images)
+        else:
+            predictions, _ = _cpu_postprocess_without_camera(self._demo, predictions, images)
         _sync_if_cuda(self.device)
         profile["postprocess_sec"] = time.perf_counter() - postprocess_start
 
@@ -321,6 +350,7 @@ class LingBotReconstructor:
             "enable_depth": self.enable_depth,
             "enable_point": self.enable_point,
             "enable_3d_rope": self.enable_3d_rope,
+            "use_sdpa": self.use_sdpa,
             "depth_head_backend": self._depth_head_backend,
             "depth_head_trt_engine": str(self.depth_head_trt_engine) if self.depth_head_trt_engine else "",
             "model_patch_embed": self.model_patch_embed,

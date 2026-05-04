@@ -12,11 +12,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Publish a LingBot live_map.npz as ROS2 PointCloud2 for RViz2.")
     parser.add_argument("--map-dir", type=Path, required=True)
     parser.add_argument("--topic", default="/lingbot/cloud")
+    parser.add_argument("--plain-topic", default="", help="Optional second topic with the same xyz and neutral gray RGB.")
     parser.add_argument("--frame-id", default="map")
     parser.add_argument("--mode", choices=("all", "current", "reveal"), default="reveal")
     parser.add_argument("--fps", type=float, default=4.0)
     parser.add_argument("--max-points", type=int, default=250000)
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--watch", action="store_true", help="Reload live_map.npz when it changes on disk.")
     parser.add_argument("--semantic-color", action="store_true")
     return parser.parse_args()
 
@@ -88,7 +90,10 @@ def main() -> int:
     from std_msgs.msg import Header
 
     args = parse_args()
+    map_path = args.map_dir.expanduser().resolve() / "live_map.npz"
+    last_mtime = 0.0
     xyz, rgb, frame = load_cloud(args.map_dir, args.semantic_color)
+    last_mtime = map_path.stat().st_mtime if map_path.exists() else 0.0
     frame_ids = np.unique(frame)
     frame_ids.sort()
     if frame_ids.size == 0:
@@ -97,6 +102,7 @@ def main() -> int:
     rclpy.init()
     node = Node("lingbot_live_map_publisher")
     pub = node.create_publisher(PointCloud2, args.topic, 2)
+    plain_pub = node.create_publisher(PointCloud2, args.plain_topic, 2) if args.plain_topic else None
     fields = [
         PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
         PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
@@ -105,13 +111,29 @@ def main() -> int:
     ]
     print(
         f"Publishing {xyz.shape[0]} points from {args.map_dir} to {args.topic} "
-        f"mode={args.mode} fps={args.fps}",
+        f"mode={args.mode} fps={args.fps}"
+        + (f" plain_topic={args.plain_topic}" if args.plain_topic else ""),
         flush=True,
     )
     period = 1.0 / max(0.1, float(args.fps))
     index = 0
     try:
         while rclpy.ok():
+            if args.watch and map_path.exists():
+                mtime = map_path.stat().st_mtime
+                if mtime > last_mtime:
+                    try:
+                        xyz, rgb, frame = load_cloud(args.map_dir, args.semantic_color)
+                        frame_ids = np.unique(frame)
+                        frame_ids.sort()
+                        index = min(index, max(0, frame_ids.size - 1))
+                        last_mtime = mtime
+                        print(f"reloaded {xyz.shape[0]} points from {map_path}", flush=True)
+                    except Exception as exc:
+                        print(f"Warning: failed to reload {map_path}: {type(exc).__name__}: {exc}", flush=True)
+            if frame_ids.size == 0:
+                time.sleep(period)
+                continue
             frame_id = int(frame_ids[index])
             xyz_sel, rgb_sel = select_points(xyz, rgb, frame, frame_id, args.mode, args.max_points)
             cloud = np.zeros((xyz_sel.shape[0], 4), dtype=np.float32)
@@ -126,6 +148,17 @@ def main() -> int:
                 points=cloud,
             )
             pub.publish(msg)
+            if plain_pub is not None:
+                plain_cloud = cloud.copy()
+                plain_rgb = np.full((xyz_sel.shape[0], 3), 220, dtype=np.uint8)
+                plain_cloud[:, 3] = pack_rgb(plain_rgb)
+                plain_pub.publish(
+                    point_cloud2.create_cloud(
+                        header=header,
+                        fields=fields,
+                        points=plain_cloud,
+                    )
+                )
             print(f"frame={frame_id} published_points={xyz_sel.shape[0]}", flush=True)
             rclpy.spin_once(node, timeout_sec=0.0)
             time.sleep(period)

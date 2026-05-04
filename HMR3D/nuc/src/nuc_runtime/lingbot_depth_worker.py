@@ -27,6 +27,7 @@ class LingBotDepthWorkerConfig:
     max_queue: int = 4
     force_cpu: bool = False
     offload_to_cpu: bool = True
+    use_sdpa: bool = False
     enable_camera: bool = False
     enable_depth: bool = True
     enable_point: bool = False
@@ -193,6 +194,7 @@ class LingBotDepthWorker:
             keyframe_interval=self.config.keyframe_interval,
             camera_num_iterations=self.config.camera_num_iterations,
             offload_to_cpu=self.config.offload_to_cpu,
+            use_sdpa=self.config.use_sdpa,
             force_cpu=self.config.force_cpu,
             enable_camera=self.config.enable_camera,
             enable_depth=self.config.enable_depth,
@@ -270,7 +272,9 @@ class LingBotDepthWorker:
             end_to_end_sec=max(0.0, finished - queued_monotonic) if queued_monotonic > 0 else elapsed,
         )
         result_path = window_dir / "worker_result.json"
-        result_path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+        tmp_result_path = result_path.with_suffix(".json.tmp")
+        tmp_result_path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+        tmp_result_path.replace(result_path)
         with self._lock:
             self._completed_windows += 1
             self._last_result = result

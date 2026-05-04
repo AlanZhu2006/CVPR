@@ -13,6 +13,21 @@ INTRINSIC_CAMERA_INDEX="${INTRINSIC_CAMERA_INDEX:-0}"
 MONO_FIXED_STEP_SCALE="${MONO_FIXED_STEP_SCALE:-0.5}"
 MONO_SCALE_SOURCE="${MONO_SCALE_SOURCE:-fixed}"
 OXTS_DIR="${OXTS_DIR:-}"
+HIKROBOT_INDEX="${HIKROBOT_INDEX:-0}"
+HIKROBOT_TIMEOUT_MS="${HIKROBOT_TIMEOUT_MS:-2000}"
+HIKROBOT_EXPOSURE_US="${HIKROBOT_EXPOSURE_US:-15000}"
+HIKROBOT_GAIN="${HIKROBOT_GAIN:-12}"
+HIKROBOT_FPS="${HIKROBOT_FPS:-5}"
+HIKROBOT_WIDTH="${HIKROBOT_WIDTH:-640}"
+HIKROBOT_HEIGHT="${HIKROBOT_HEIGHT:-512}"
+HIKROBOT_THREADED_CAPTURE="${HIKROBOT_THREADED_CAPTURE:-1}"
+HIKROBOT_CAPTURE_QUEUE_SIZE="${HIKROBOT_CAPTURE_QUEUE_SIZE:-6}"
+HIKROBOT_MAX_READ_ERRORS="${HIKROBOT_MAX_READ_ERRORS:-100}"
+CAMERA_FX="${CAMERA_FX:-0}"
+CAMERA_FY="${CAMERA_FY:-0}"
+CAMERA_CX="${CAMERA_CX:-0}"
+CAMERA_CY="${CAMERA_CY:-0}"
+RGB_OUTPUT_DIR="${RGB_OUTPUT_DIR:-}"
 COLOR_IMAGE_DIR="${COLOR_IMAGE_DIR:-}"
 COLOR_IMAGE_TEMPLATE="${COLOR_IMAGE_TEMPLATE:-{frame_idx:010d}.png}"
 LINGBOT_ROOT="${LINGBOT_ROOT:-$ROOT_DIR/third_party_research/lingbot-map}"
@@ -31,6 +46,7 @@ DROP_WHEN_BUSY="${DROP_WHEN_BUSY:-0}"
 FRAME_SLEEP_SEC="${FRAME_SLEEP_SEC:-0}"
 DEPTH_SCALE="${DEPTH_SCALE:-20.0}"
 SAMPLE_STRIDE="${SAMPLE_STRIDE:-8}"
+SAMPLING_PATTERN="${SAMPLING_PATTERN:-grid}"
 MAX_POINTS_PER_FRAME="${MAX_POINTS_PER_FRAME:-2500}"
 MAX_ACTIVE_FRAMES="${MAX_ACTIVE_FRAMES:-16}"
 FUSION_MODE="${FUSION_MODE:-raw}"
@@ -58,6 +74,24 @@ MODEL_MLP_RATIO="${MODEL_MLP_RATIO:-0}"
 COMPRESS_OUTPUTS="${COMPRESS_OUTPUTS:-0}"
 PUBLISH_EVERY_WINDOWS="${PUBLISH_EVERY_WINDOWS:-1}"
 PUBLISH_EVERY_FRAMES="${PUBLISH_EVERY_FRAMES:-1}"
+ROS2_PUBLISH="${ROS2_PUBLISH:-0}"
+ROS2_IMAGE_TOPIC="${ROS2_IMAGE_TOPIC:-/neural_mapping/rgb}"
+ROS2_CAMERA_INFO_TOPIC="${ROS2_CAMERA_INFO_TOPIC:-/neural_mapping/camera_info}"
+ROS2_POSE_TOPIC="${ROS2_POSE_TOPIC:-/neural_mapping/pose}"
+ROS2_PATH_TOPIC="${ROS2_PATH_TOPIC:-/neural_mapping/path}"
+ROS2_CLOUD_TOPIC="${ROS2_CLOUD_TOPIC:-/neural_mapping/pointcloud}"
+ROS2_PLAIN_CLOUD_TOPIC="${ROS2_PLAIN_CLOUD_TOPIC:-/lingbot/cloud_plain}"
+ROS2_CURRENT_CLOUD_TOPIC="${ROS2_CURRENT_CLOUD_TOPIC:-/lingbot/current_cloud_rgb}"
+ROS2_CURRENT_PLAIN_CLOUD_TOPIC="${ROS2_CURRENT_PLAIN_CLOUD_TOPIC:-/lingbot/current_cloud_plain}"
+ROS2_CAMERA_FRAME_ID="${ROS2_CAMERA_FRAME_ID:-hikrobot_camera}"
+ROS2_CLOUD_FRAME_ID="${ROS2_CLOUD_FRAME_ID:-map}"
+ROS2_MAX_CLOUD_POINTS="${ROS2_MAX_CLOUD_POINTS:-120000}"
+ROS2_MAX_CURRENT_CLOUD_POINTS="${ROS2_MAX_CURRENT_CLOUD_POINTS:-60000}"
+ROS2_IMAGE_MAX_WIDTH="${ROS2_IMAGE_MAX_WIDTH:-960}"
+ROS2_IMAGE_MAX_HEIGHT="${ROS2_IMAGE_MAX_HEIGHT:-540}"
+ROS2_CLOUD_MIN_INTERVAL_SEC="${ROS2_CLOUD_MIN_INTERVAL_SEC:-0.25}"
+ROS2_REPUBLISH_CURRENT_CLOUD_ON_IMAGE="${ROS2_REPUBLISH_CURRENT_CLOUD_ON_IMAGE:-1}"
+ROS2_PATH_MAX_POSES="${ROS2_PATH_MAX_POSES:-1200}"
 PORT="${PORT:-19092}"
 
 if [[ -z "$DEPTH_HEAD_TRT_ENGINE_WAS_SET" && ( -n "$MODEL_PATCH_EMBED" || "$MODEL_EMBED_DIM" != "0" || "$MODEL_DEPTH" != "0" ) ]]; then
@@ -74,7 +108,7 @@ if [[ ! -f "$MODEL_PATH" ]]; then
   echo "Missing LingBot depth checkpoint: $MODEL_PATH" >&2
   exit 1
 fi
-if [[ ! -d "$SEQUENCE_DIR" ]]; then
+if [[ "$TRACKING_BACKEND" != "hikrobot_mono_rgb" && ! -d "$SEQUENCE_DIR" ]]; then
   echo "Missing sequence dir: $SEQUENCE_DIR" >&2
   exit 1
 fi
@@ -82,19 +116,20 @@ if [[ "$TRACKING_BACKEND" == "pose_file" && ! -f "$TRAJECTORY_PATH" ]]; then
   echo "Missing trajectory: $TRAJECTORY_PATH" >&2
   exit 1
 fi
-if [[ "$TRACKING_BACKEND" != "pose_file" && -z "$RGB_IMAGE_DIR" && -z "$COLOR_IMAGE_DIR" ]]; then
+if [[ "$TRACKING_BACKEND" != "pose_file" && "$TRACKING_BACKEND" != "hikrobot_mono_rgb" && -z "$RGB_IMAGE_DIR" && -z "$COLOR_IMAGE_DIR" ]]; then
   echo "Tracking backend $TRACKING_BACKEND requires RGB_IMAGE_DIR or COLOR_IMAGE_DIR" >&2
   exit 1
 fi
 
 export PYTHONPATH="$ROOT_DIR/HMR3D/nuc/src${PYTHONPATH:+:$PYTHONPATH}"
 export LINGBOT_MAP_ROOT="$LINGBOT_ROOT"
-export LINGBOT_LOAD_CHECKPOINT_ON_CPU=1
-export LINGBOT_CHECKPOINT_MMAP=0
-export LINGBOT_MODEL_DTYPE=fp16
-export LINGBOT_CPU_CAST_BEFORE_CUDA=1
-export LINGBOT_CPU_CAST_SCOPE=aggregator
+export LINGBOT_LOAD_CHECKPOINT_ON_CPU="${LINGBOT_LOAD_CHECKPOINT_ON_CPU:-1}"
+export LINGBOT_CHECKPOINT_MMAP="${LINGBOT_CHECKPOINT_MMAP:-1}"
+export LINGBOT_MODEL_DTYPE="${LINGBOT_MODEL_DTYPE:-fp16}"
+export LINGBOT_CPU_CAST_BEFORE_CUDA="${LINGBOT_CPU_CAST_BEFORE_CUDA:-1}"
+export LINGBOT_CPU_CAST_SCOPE="${LINGBOT_CPU_CAST_SCOPE:-model}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-8.7}"
 
 echo "cuVSLAM + LingBot live reconstruction"
 echo "  sequence:   $SEQUENCE_DIR"
@@ -107,6 +142,9 @@ if [[ -n "$RGB_IMAGE_DIR" ]]; then
 fi
 if [[ -n "$COLOR_IMAGE_DIR" ]]; then
   echo "  color RGB:  $COLOR_IMAGE_DIR ($COLOR_IMAGE_TEMPLATE)"
+fi
+if [[ "$TRACKING_BACKEND" == "hikrobot_mono_rgb" ]]; then
+  echo "  hikrobot:   ${HIKROBOT_WIDTH}x${HIKROBOT_HEIGHT}@${HIKROBOT_FPS}fps exposure=${HIKROBOT_EXPOSURE_US} gain=${HIKROBOT_GAIN}"
 fi
 echo "  output:     $OUTPUT_DIR"
 echo "  image size: $IMAGE_SIZE"
@@ -157,6 +195,9 @@ if [[ "$ADAPTIVE_SAMPLING" == "1" ]]; then
   extra_args+=(--adaptive-sampling)
   echo "  sampling: adaptive near=$NEAR_SAMPLE_STRIDE edge=$EDGE_SAMPLE_STRIDE semantic=$SEMANTIC_SAMPLE_STRIDE"
 fi
+if [[ "$HIKROBOT_THREADED_CAPTURE" == "1" ]]; then
+  extra_args+=(--hikrobot-threaded-capture)
+fi
 if [[ -n "$YOLO_MODEL" ]]; then
   extra_args+=(--yolo-model "$YOLO_MODEL" --yolo-conf "$YOLO_CONF" --yolo-imgsz "$YOLO_IMGSZ")
   echo "  YOLO:       $YOLO_MODEL conf=$YOLO_CONF imgsz=$YOLO_IMGSZ"
@@ -164,6 +205,31 @@ fi
 if [[ "$SEMANTIC_COLOR_OUTPUT" == "1" ]]; then
   extra_args+=(--semantic-color-output)
   echo "  color:      semantic labels override RGB when available"
+fi
+if [[ "$ROS2_PUBLISH" == "1" ]]; then
+  extra_args+=(
+    --ros2-publish
+    --ros2-image-topic "$ROS2_IMAGE_TOPIC"
+    --ros2-camera-info-topic "$ROS2_CAMERA_INFO_TOPIC"
+    --ros2-pose-topic "$ROS2_POSE_TOPIC"
+    --ros2-path-topic "$ROS2_PATH_TOPIC"
+    --ros2-cloud-topic "$ROS2_CLOUD_TOPIC"
+    --ros2-plain-cloud-topic "$ROS2_PLAIN_CLOUD_TOPIC"
+    --ros2-current-cloud-topic "$ROS2_CURRENT_CLOUD_TOPIC"
+    --ros2-current-plain-cloud-topic "$ROS2_CURRENT_PLAIN_CLOUD_TOPIC"
+    --ros2-camera-frame-id "$ROS2_CAMERA_FRAME_ID"
+    --ros2-cloud-frame-id "$ROS2_CLOUD_FRAME_ID"
+    --ros2-max-cloud-points "$ROS2_MAX_CLOUD_POINTS"
+    --ros2-max-current-cloud-points "$ROS2_MAX_CURRENT_CLOUD_POINTS"
+    --ros2-image-max-width "$ROS2_IMAGE_MAX_WIDTH"
+    --ros2-image-max-height "$ROS2_IMAGE_MAX_HEIGHT"
+    --ros2-cloud-min-interval-sec "$ROS2_CLOUD_MIN_INTERVAL_SEC"
+    --ros2-path-max-poses "$ROS2_PATH_MAX_POSES"
+  )
+  if [[ "$ROS2_REPUBLISH_CURRENT_CLOUD_ON_IMAGE" == "1" ]]; then
+    extra_args+=(--ros2-republish-current-cloud-on-image)
+  fi
+  echo "  ros2:       publish rgb/pose/path/cloud for GS Console"
 fi
 
 "$PYTHON_BIN" HMR3D/nuc/scripts/run_cuvslam_lingbot_live_reconstruction.py \
@@ -175,6 +241,20 @@ fi
   --mono-fixed-step-scale "$MONO_FIXED_STEP_SCALE" \
   --mono-scale-source "$MONO_SCALE_SOURCE" \
   --oxts-dir "$OXTS_DIR" \
+  --hikrobot-index "$HIKROBOT_INDEX" \
+  --hikrobot-timeout-ms "$HIKROBOT_TIMEOUT_MS" \
+  --hikrobot-exposure-us "$HIKROBOT_EXPOSURE_US" \
+  --hikrobot-gain "$HIKROBOT_GAIN" \
+  --hikrobot-fps "$HIKROBOT_FPS" \
+  --hikrobot-width "$HIKROBOT_WIDTH" \
+  --hikrobot-height "$HIKROBOT_HEIGHT" \
+  --hikrobot-capture-queue-size "$HIKROBOT_CAPTURE_QUEUE_SIZE" \
+  --hikrobot-max-read-errors "$HIKROBOT_MAX_READ_ERRORS" \
+  --camera-fx "$CAMERA_FX" \
+  --camera-fy "$CAMERA_FY" \
+  --camera-cx "$CAMERA_CX" \
+  --camera-cy "$CAMERA_CY" \
+  --rgb-output-dir "$RGB_OUTPUT_DIR" \
   --color-image-dir "$COLOR_IMAGE_DIR" \
   --color-image-template "$COLOR_IMAGE_TEMPLATE" \
   --model-path "$MODEL_PATH" \
@@ -191,6 +271,7 @@ fi
   --frame-sleep-sec "$FRAME_SLEEP_SEC" \
   --depth-scale "$DEPTH_SCALE" \
   --sample-stride "$SAMPLE_STRIDE" \
+  --sampling-pattern "$SAMPLING_PATTERN" \
   --max-points-per-frame "$MAX_POINTS_PER_FRAME" \
   --max-active-frames "$MAX_ACTIVE_FRAMES" \
   --fusion-mode "$FUSION_MODE" \

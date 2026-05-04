@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any
 
@@ -157,6 +158,10 @@ class GaussianSplatRenderer:
             "source": bundle.get("source", np.zeros((count,), dtype=np.int8)).astype(np.int8),
             "provenance": bundle.get("provenance", np.full((count,), 3, dtype=np.int8)).astype(np.int8),
         }
+        if "gsplat_scales" in bundle and bundle["gsplat_scales"].shape[0] == count:
+            normalized["gsplat_scales"] = bundle["gsplat_scales"].astype(np.float32)
+        if "gsplat_quats" in bundle and bundle["gsplat_quats"].shape[0] == count:
+            normalized["gsplat_quats"] = bundle["gsplat_quats"].astype(np.float32)
         return normalized
 
     def _limit_bundle_points(self, bundle: dict[str, np.ndarray], max_points: int) -> dict[str, np.ndarray]:
@@ -361,6 +366,11 @@ class GaussianSplatRenderer:
         axis_u = axis_u[keep]
         axis_v = axis_v[keep]
         scale_base = bundle["scale"][valid].astype(np.float32)[keep]
+        gsplat_scales = bundle.get("gsplat_scales")
+        gsplat_quats = bundle.get("gsplat_quats")
+        if gsplat_scales is not None and gsplat_quats is not None:
+            gsplat_scales = gsplat_scales[valid].astype(np.float32)[keep]
+            gsplat_quats = gsplat_quats[valid].astype(np.float32)[keep]
         projected_points = int(xyz.shape[0])
         if projected_points <= 0:
             blank = np.full((h, w, 3), self.output_config.render_background_gray, dtype=np.uint8)
@@ -369,18 +379,14 @@ class GaussianSplatRenderer:
         means = torch.from_numpy(xyz).to(device="cuda", dtype=torch.float32)
         colors = torch.from_numpy(rgb).to(device="cuda", dtype=torch.float32)
         opacities = torch.from_numpy(opacity).to(device="cuda", dtype=torch.float32)
-        scales, quats = self._axes_to_gsplat_params(axis_u=axis_u, axis_v=axis_v, scale_base=scale_base)
+        if gsplat_scales is not None and gsplat_quats is not None:
+            scales, quats = gsplat_scales, gsplat_quats
+        else:
+            scales, quats = self._axes_to_gsplat_params(axis_u=axis_u, axis_v=axis_v, scale_base=scale_base)
         scales_t = torch.from_numpy(scales).to(device="cuda", dtype=torch.float32)
         quats_t = torch.from_numpy(quats).to(device="cuda", dtype=torch.float32)
         viewmat = torch.from_numpy(np.linalg.inv(pose).astype(np.float32)).to(device="cuda").unsqueeze(0)
         Ks = torch.from_numpy(K).to(device="cuda", dtype=torch.float32).unsqueeze(0)
-        background = torch.full(
-            (1, 3),
-            float(self.output_config.render_background_gray) / 255.0,
-            device="cuda",
-            dtype=torch.float32,
-        )
-
         render_colors, _, _ = gsplat.rasterization(
             means=means,
             quats=quats_t,
@@ -396,7 +402,6 @@ class GaussianSplatRenderer:
             radius_clip=float(self.output_config.render_gsplat_radius_clip),
             packed=True,
             tile_size=int(self.output_config.render_gsplat_tile_size),
-            backgrounds=background,
             render_mode="RGB",
             rasterize_mode=str(self.output_config.render_gsplat_rasterize_mode),
         )
@@ -785,6 +790,15 @@ class GaussianSplatRenderer:
     def _load_intrinsics(self, image_path: str | None, w: int, h: int) -> np.ndarray:
         if image_path is None:
             return np.array([[700.0, 0.0, w * 0.5], [0.0, 700.0, h * 0.5], [0.0, 0.0, 1.0]], dtype=np.float32)
+        sidecar_path = Path(image_path).expanduser().resolve()
+        if sidecar_path.exists() and sidecar_path.suffix == ".json":
+            try:
+                payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                K = np.asarray(payload.get("K"), dtype=np.float32)
+                if K.shape == (3, 3):
+                    return K
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
         sequence_path = Path(image_path).expanduser().resolve().parents[1]
         cached = self._intrinsics_cache.get(sequence_path)
         if cached is not None:
