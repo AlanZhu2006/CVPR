@@ -23,3 +23,5 @@ third_party_research/lingbot-map/**/*.py[cod]
 *.pt
 *.pth
 *.ckpt
+third_party_research/lingbot-map
+third_party_research/SplaTAM
