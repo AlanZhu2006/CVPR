@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-scale-frames", type=int, default=8)
     parser.add_argument("--keyframe-interval", type=int, default=1)
     parser.add_argument("--camera-num-iterations", type=int, default=1)
+    parser.add_argument("--use-sdpa", action="store_true")
     parser.add_argument("--no-offload-to-cpu", action="store_true")
     parser.add_argument("--disable-camera", action="store_true")
     parser.add_argument("--disable-point", action="store_true")
@@ -63,6 +64,7 @@ def main() -> None:
         num_scale_frames=args.num_scale_frames,
         keyframe_interval=args.keyframe_interval,
         camera_num_iterations=args.camera_num_iterations,
+        use_sdpa=args.use_sdpa,
         offload_to_cpu=not args.no_offload_to_cpu,
         enable_camera=not args.disable_camera,
         enable_point=not args.disable_point,

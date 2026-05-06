@@ -85,6 +85,37 @@ def _cpu_postprocess_without_camera(
     return predictions, images_cpu
 
 
+def _prediction_frame_count(predictions: dict[str, np.ndarray], fallback: int) -> int:
+    for key in ("depth", "depth_conf", "world_points", "world_points_conf", "pose_enc"):
+        value = predictions.get(key)
+        if isinstance(value, np.ndarray) and value.ndim >= 1:
+            return int(value.shape[0])
+    return int(fallback)
+
+
+def _trim_metadata_to_frame_count(metadata: dict[str, Any], frame_count: int) -> dict[str, Any]:
+    frame_count = max(1, int(frame_count))
+    trimmed = dict(metadata)
+    for key in (
+        "frames",
+        "frame_indices",
+        "timestamps_sec",
+        "original_image_paths",
+        "cuvslam_poses",
+        "frame_shapes",
+        "track_oks",
+        "is_keyframes",
+        "keypoint_counts",
+        "match_counts",
+        "inlier_counts",
+        "pixel_motions",
+    ):
+        value = trimmed.get(key)
+        if isinstance(value, list) and len(value) > frame_count:
+            trimmed[key] = value[-frame_count:]
+    return trimmed
+
+
 @dataclass
 class LingBotReconBundle:
     image_paths: list[str]
@@ -117,6 +148,11 @@ class LingBotReconstructor:
         model_depth: int = 0,
         model_num_heads: int = 0,
         model_mlp_ratio: float = 0.0,
+        compile_model: bool = False,
+        compile_warmup_passes: int = 3,
+        compile_warmup_stream_frames: int = 10,
+        persistent_streaming: bool = False,
+        dense_state_callback: Any | None = None,
     ):
         self.model_path = Path(model_path).expanduser().resolve()
         self.image_size = image_size
@@ -143,16 +179,32 @@ class LingBotReconstructor:
         self.model_depth = model_depth
         self.model_num_heads = model_num_heads
         self.model_mlp_ratio = model_mlp_ratio
+        self.compile_model_enabled = bool(compile_model)
+        self.compile_warmup_passes = max(1, int(compile_warmup_passes))
+        self.compile_warmup_stream_frames = max(1, int(compile_warmup_stream_frames))
+        self.persistent_streaming = bool(persistent_streaming)
+        self.dense_state_callback = dense_state_callback
         self._depth_head_backend = "torch"
         self._model_load_missing = 0
         self._model_load_unexpected = 0
         self._aggregator_dtype: str | None = None
+        self._compiled = False
+        self._stream_initialized = False
+        self._stream_seen_frames = 0
 
         self._demo = _import_lingbot_demo()
         self._device = torch.device(
             "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self._model = None
+
+    def _set_dense_state(self, state: str) -> None:
+        if self.dense_state_callback is None:
+            return
+        try:
+            self.dense_state_callback(str(state))
+        except Exception:
+            pass
 
     @property
     def device(self) -> torch.device:
@@ -238,6 +290,177 @@ class LingBotReconstructor:
             self._depth_head_backend = "tensorrt"
         return self._model
 
+    def _maybe_compile_model(
+        self,
+        model: Any,
+        images: torch.Tensor,
+        dtype: torch.dtype,
+        profile: dict[str, float],
+    ) -> None:
+        if self._compiled or not self.compile_model_enabled:
+            return
+        if self.device.type != "cuda" or self.mode != "streaming":
+            profile["compile_skipped_sec"] = 0.0
+            return
+        if self.use_sdpa:
+            raise RuntimeError("LingBot compile fast path expects FlashInfer; disable USE_SDPA.")
+        if not hasattr(self._demo, "compile_model") or not hasattr(self._demo, "_warm_streaming"):
+            raise RuntimeError("LingBot demo module does not expose compile_model/_warm_streaming.")
+
+        num_frames = int(images.shape[0])
+        scale_for_warm = max(1, min(int(self.num_scale_frames), num_frames))
+        warm_stream_n = max(1, int(self.compile_warmup_stream_frames))
+        warm_images = images
+        required_frames = scale_for_warm + warm_stream_n
+        if num_frames < required_frames:
+            repeat_count = required_frames - num_frames
+            pad = images[-1:].repeat(repeat_count, 1, 1, 1)
+            warm_images = torch.cat([images, pad], dim=0)
+        else:
+            warm_stream_n = min(warm_stream_n, max(1, num_frames - scale_for_warm))
+
+        print(
+            "LingBot torch.compile warmup: "
+            f"window_frames={num_frames} warm_frames={int(warm_images.shape[0])} "
+            f"scale_frames={scale_for_warm} stream_frames={warm_stream_n} "
+            f"passes={self.compile_warmup_passes}",
+            flush=True,
+        )
+
+        eager_start = time.perf_counter()
+        self._demo._warm_streaming(
+            model,
+            warm_images,
+            scale_for_warm,
+            warm_stream_n,
+            dtype,
+            passes=1,
+            keyframe_interval=self.keyframe_interval,
+        )
+        profile["compile_eager_warmup_sec"] = time.perf_counter() - eager_start
+        print(
+            f"LingBot torch.compile eager warmup done: {profile['compile_eager_warmup_sec']:.3f}s",
+            flush=True,
+        )
+
+        compile_start = time.perf_counter()
+        self._demo.compile_model(model)
+        _sync_if_cuda(self.device)
+        profile["compile_model_sec"] = time.perf_counter() - compile_start
+        print(
+            f"LingBot torch.compile graph wrapping done: {profile['compile_model_sec']:.3f}s",
+            flush=True,
+        )
+
+        compiled_start = time.perf_counter()
+        self._demo._warm_streaming(
+            model,
+            warm_images,
+            scale_for_warm,
+            warm_stream_n,
+            dtype,
+            passes=self.compile_warmup_passes,
+            keyframe_interval=self.keyframe_interval,
+        )
+        profile["compile_warmup_sec"] = time.perf_counter() - compiled_start
+        self._compiled = True
+        print(
+            f"LingBot torch.compile compiled warmup done: {profile['compile_warmup_sec']:.3f}s",
+            flush=True,
+        )
+
+    def _run_persistent_streaming(
+        self,
+        model: Any,
+        images: torch.Tensor,
+        dtype: torch.dtype,
+        output_device: torch.device | None,
+        profile: dict[str, float],
+    ) -> dict[str, Any]:
+        if self.mode != "streaming":
+            raise RuntimeError("persistent_streaming only supports streaming mode")
+        if images.ndim != 4:
+            raise ValueError(f"Expected preprocessed images [S,C,H,W], got shape={tuple(images.shape)}")
+        num_frames = int(images.shape[0])
+        scale_frames = max(1, int(self.num_scale_frames))
+        if not self._stream_initialized and num_frames < scale_frames:
+            raise ValueError(
+                f"persistent_streaming needs at least {scale_frames} scale frames for first call, "
+                f"got {num_frames}"
+            )
+
+        def _to_out(t: torch.Tensor) -> torch.Tensor:
+            if output_device is not None:
+                return t.to(output_device)
+            return t
+
+        predictions: dict[str, Any] = {}
+        model_device = next(model.parameters()).device
+        with torch.no_grad():
+            if self.device.type == "cuda":
+                autocast = torch.amp.autocast("cuda", dtype=dtype)
+            else:
+                autocast = torch.amp.autocast("cpu", enabled=False)
+            with autocast:
+                if not self._stream_initialized:
+                    clean_start = time.perf_counter()
+                    model.clean_kv_cache()
+                    _sync_if_cuda(self.device)
+                    profile["stream_clean_cache_sec"] = time.perf_counter() - clean_start
+
+                    scale_images = images[:scale_frames].unsqueeze(0).to(model_device, non_blocking=True)
+                    torch.compiler.cudagraph_mark_step_begin()
+                    forward_start = time.perf_counter()
+                    output = model.forward(
+                        scale_images,
+                        num_frame_for_scale=scale_frames,
+                        num_frame_per_block=scale_frames,
+                        causal_inference=True,
+                    )
+                    _sync_if_cuda(self.device)
+                    profile["stream_scale_forward_sec"] = time.perf_counter() - forward_start
+                    self._stream_initialized = True
+                    self._stream_seen_frames = scale_frames
+                    profile["persistent_stream_stage"] = "scale"
+                else:
+                    frame_image = images[-1:].unsqueeze(0).to(model_device, non_blocking=True)
+                    is_keyframe = (
+                        self.keyframe_interval <= 1
+                        or ((self._stream_seen_frames - scale_frames) % self.keyframe_interval == 0)
+                    )
+                    profile["persistent_stream_stage"] = "incremental"
+                    profile["persistent_stream_keyframe"] = 1.0 if is_keyframe else 0.0
+                    if not is_keyframe:
+                        model._set_skip_append(True)
+                    torch.compiler.cudagraph_mark_step_begin()
+                    forward_start = time.perf_counter()
+                    output = model.forward(
+                        frame_image,
+                        num_frame_for_scale=scale_frames,
+                        num_frame_per_block=1,
+                        causal_inference=True,
+                    )
+                    _sync_if_cuda(self.device)
+                    profile["stream_incremental_forward_sec"] = time.perf_counter() - forward_start
+                    if not is_keyframe:
+                        model._set_skip_append(False)
+                    self._stream_seen_frames += 1
+
+        for key in ("pose_enc", "depth", "depth_conf", "world_points", "world_points_conf"):
+            if key in output:
+                predictions[key] = _to_out(output[key])
+        del output
+        profile["persistent_stream_seen_frames"] = float(self._stream_seen_frames)
+        if hasattr(model, "get_kv_cache_info"):
+            try:
+                info = model.get_kv_cache_info()
+                for key, value in info.items():
+                    if isinstance(value, (int, float)):
+                        profile[f"kv_cache_{key}"] = float(value)
+            except Exception:
+                pass
+        return predictions
+
     def run_on_image_paths(self, image_paths: list[str]) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         if not image_paths:
             raise ValueError("LingBotReconstructor requires at least one image path")
@@ -245,6 +468,7 @@ class LingBotReconstructor:
         profile: dict[str, float] = {}
         total_start = time.perf_counter()
 
+        self._set_dense_state("PREPROCESSING")
         load_start = time.perf_counter()
         model = self._load_model()
         _sync_if_cuda(self.device)
@@ -271,6 +495,8 @@ class LingBotReconstructor:
                 dtype = torch.float16
             elif env_dtype in {"bf16", "bfloat16"}:
                 dtype = torch.bfloat16
+            elif env_dtype in {"fp32", "float32"}:
+                dtype = torch.float32
             else:
                 dtype = (
                     torch.bfloat16
@@ -291,32 +517,39 @@ class LingBotReconstructor:
         _sync_if_cuda(self.device)
         profile["dtype_setup_sec"] = time.perf_counter() - dtype_start
 
+        self._maybe_compile_model(model, images, dtype, profile)
+
         output_device = torch.device("cpu") if self.offload_to_cpu else None
         _sync_if_cuda(self.device)
+        self._set_dense_state("MODEL_FORWARD_ACTIVE")
         forward_start = time.perf_counter()
-        with torch.no_grad():
-            if self.device.type == "cuda":
-                autocast = torch.amp.autocast("cuda", dtype=dtype)
-            else:
-                autocast = torch.amp.autocast("cpu", enabled=False)
-            with autocast:
-                if self.mode == "streaming":
-                    predictions = model.inference_streaming(
-                        images,
-                        num_scale_frames=self.num_scale_frames,
-                        keyframe_interval=self.keyframe_interval,
-                        output_device=output_device,
-                    )
+        if self.persistent_streaming:
+            predictions = self._run_persistent_streaming(model, images, dtype, output_device, profile)
+        else:
+            with torch.no_grad():
+                if self.device.type == "cuda":
+                    autocast = torch.amp.autocast("cuda", dtype=dtype)
                 else:
-                    predictions = model.inference_windowed(
-                        images,
-                        window_size=max(2, len(image_paths)),
-                        overlap_size=0,
-                        output_device=output_device,
-                    )
+                    autocast = torch.amp.autocast("cpu", enabled=False)
+                with autocast:
+                    if self.mode == "streaming":
+                        predictions = model.inference_streaming(
+                            images,
+                            num_scale_frames=self.num_scale_frames,
+                            keyframe_interval=self.keyframe_interval,
+                            output_device=output_device,
+                        )
+                    else:
+                        predictions = model.inference_windowed(
+                            images,
+                            window_size=max(2, len(image_paths)),
+                            overlap_size=0,
+                            output_device=output_device,
+                        )
         _sync_if_cuda(self.device)
         profile["model_forward_sec"] = time.perf_counter() - forward_start
 
+        self._set_dense_state("POSTPROCESSING")
         postprocess_start = time.perf_counter()
         if "pose_enc" in predictions:
             predictions, _ = self._demo.postprocess(predictions, images)
@@ -358,6 +591,13 @@ class LingBotReconstructor:
             "model_depth": self.model_depth,
             "model_num_heads": self.model_num_heads,
             "model_mlp_ratio": self.model_mlp_ratio,
+            "compile_model": self.compile_model_enabled,
+            "compile_warmup_passes": self.compile_warmup_passes,
+            "compile_warmup_stream_frames": self.compile_warmup_stream_frames,
+            "compiled": self._compiled,
+            "persistent_streaming": self.persistent_streaming,
+            "persistent_stream_initialized": self._stream_initialized,
+            "persistent_stream_seen_frames": self._stream_seen_frames,
             "model_load_missing_keys": self._model_load_missing,
             "model_load_unexpected_keys": self._model_load_unexpected,
             "prediction_keys": sorted(predictions_np.keys()),
@@ -389,6 +629,12 @@ class LingBotReconstructor:
         output_dir.mkdir(parents=True, exist_ok=True)
         predictions_np, summary = self.run_on_image_paths(image_paths)
         if metadata:
+            frame_count = _prediction_frame_count(predictions_np, fallback=len(image_paths))
+            if frame_count != len(image_paths):
+                metadata = _trim_metadata_to_frame_count(metadata, frame_count)
+                image_paths = list(image_paths[-frame_count:])
+                summary["image_paths"] = image_paths
+                summary["frame_count"] = frame_count
             summary["metadata"] = metadata
 
         predictions_npz = output_dir / "lingbot_predictions.npz"

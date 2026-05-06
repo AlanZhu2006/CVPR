@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import math
 import os
 import queue
+import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Callable
@@ -38,6 +42,20 @@ from nuc_runtime import (
 from nuc_runtime.cuvslam_adapter import _quaternion_to_matrix
 from nuc_runtime.descriptors import compute_global_descriptor
 from nuc_runtime.models import TrackingOutput
+
+
+def _parse_float_list(raw: str | None) -> list[float]:
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    for sep in (",", ";"):
+        text = text.replace(sep, " ")
+    values: list[float] = []
+    for token in text.split():
+        values.append(float(token))
+    return values
 
 
 def _matrix_to_quaternion(rotation: np.ndarray) -> tuple[float, float, float, float]:
@@ -85,12 +103,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-path", default="nuc_output/kitti_raw_2011_09_30_0020_benchmark/cuvslam_tum.txt")
     parser.add_argument(
         "--tracking-backend",
-        choices=("pose_file", "opencv_mono_rgb", "cuvslam_mono_rgb", "hikrobot_mono_rgb"),
+        choices=("pose_file", "opencv_mono_rgb", "cuvslam_mono_rgb", "hikrobot_mono_rgb", "realsense_mono_rgb"),
         default="pose_file",
         help=(
             "pose_file replays an existing TUM trajectory; opencv_mono_rgb is a small OpenCV baseline; "
             "cuvslam_mono_rgb runs PyCuVSLAM OdometryMode.Mono on the RGB stream; "
-            "hikrobot_mono_rgb captures live RGB frames from a HikRobot MVS camera."
+            "hikrobot_mono_rgb captures live RGB frames from a HikRobot MVS camera; "
+            "realsense_mono_rgb captures live color frames from an Intel RealSense camera."
         ),
     )
     parser.add_argument(
@@ -116,11 +135,64 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Read HikRobot frames and publish /hikrobot/image_raw from a background producer thread.",
     )
+    parser.add_argument(
+        "--hikrobot-async-tracking",
+        action="store_true",
+        help="Run HikRobot cuVSLAM/OpenCV tracking in a background latest-only worker.",
+    )
+    parser.add_argument(
+        "--hikrobot-disable-cuvslam",
+        action="store_true",
+        help="Do not construct the cuVSLAM tracker for HikRobot live RGB; use the lightweight OpenCV pose source.",
+    )
     parser.add_argument("--hikrobot-capture-queue-size", type=int, default=4)
+    parser.add_argument("--hikrobot-tracking-queue-size", type=int, default=2)
+    parser.add_argument("--hikrobot-tracking-idle-fps", type=float, default=5.0)
+    parser.add_argument("--hikrobot-tracking-dense-fps", type=float, default=1.0)
+    parser.add_argument("--realsense-index", type=int, default=0)
+    parser.add_argument("--realsense-input-mode", choices=("ros2", "sdk"), default="ros2")
+    parser.add_argument("--realsense-serial", default="")
+    parser.add_argument("--realsense-image-topic", default="/camera/camera/color/image_raw")
+    parser.add_argument("--realsense-camera-info-topic", default="/camera/camera/color/camera_info")
+    parser.add_argument("--realsense-timeout-ms", type=int, default=2000)
+    parser.add_argument("--realsense-fps", type=float, default=30.0)
+    parser.add_argument("--realsense-width", type=int, default=640)
+    parser.add_argument("--realsense-height", type=int, default=480)
+    parser.add_argument("--realsense-max-read-errors", type=int, default=30)
+    parser.add_argument("--realsense-read-error-sleep-sec", type=float, default=0.05)
+    parser.add_argument(
+        "--realsense-threaded-capture",
+        action="store_true",
+        help="Read RealSense color frames and publish the live RGB topic from a background producer thread.",
+    )
+    parser.add_argument(
+        "--realsense-async-tracking",
+        action="store_true",
+        help="Run RealSense cuVSLAM/OpenCV tracking in a background latest-only worker.",
+    )
+    parser.add_argument(
+        "--realsense-disable-cuvslam",
+        action="store_true",
+        help="Do not construct the cuVSLAM tracker for RealSense live RGB; use the lightweight OpenCV pose source.",
+    )
+    parser.add_argument("--realsense-capture-queue-size", type=int, default=4)
+    parser.add_argument("--realsense-tracking-queue-size", type=int, default=2)
+    parser.add_argument("--realsense-tracking-idle-fps", type=float, default=5.0)
+    parser.add_argument("--realsense-tracking-dense-fps", type=float, default=1.0)
     parser.add_argument("--camera-fx", type=float, default=0.0)
     parser.add_argument("--camera-fy", type=float, default=0.0)
     parser.add_argument("--camera-cx", type=float, default=0.0)
     parser.add_argument("--camera-cy", type=float, default=0.0)
+    parser.add_argument(
+        "--camera-distortion-coeffs",
+        default="",
+        help="Optional Brown/plumb_bob coefficients in OpenCV order: k1 k2 p1 p2 k3.",
+    )
+    parser.add_argument(
+        "--camera-undistort",
+        action="store_true",
+        help="Undistort HikRobot frames before cuVSLAM/LingBot using --camera-distortion-coeffs.",
+    )
     parser.add_argument(
         "--rgb-output-dir",
         default="",
@@ -140,6 +212,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="third_party_research/lingbot_cache/lingbot-map-depth-fp16.pt")
     parser.add_argument("--lingbot-map-root", default="third_party_research/lingbot-map")
     parser.add_argument("--output-dir", default="nuc_output/lingbot_live_reconstruction/kitti0020_live")
+    parser.add_argument(
+        "--clean-output",
+        action="store_true",
+        help="Remove stale worker/live_map outputs before starting a live run.",
+    )
     parser.add_argument("--frame-step", type=int, default=4)
     parser.add_argument("--max-frames", type=int, default=12)
     parser.add_argument("--keyframes-only", action="store_true")
@@ -152,6 +229,50 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Submit only every Nth tracked frame to the LingBot dense worker while keeping every cuVSLAM pose.",
+    )
+    parser.add_argument(
+        "--dense-scheduler",
+        choices=("interval", "motion"),
+        default="interval",
+        help=(
+            "interval preserves fixed cadence. motion submits only when pose/pixel motion exceeds thresholds "
+            "after the minimum frame gap."
+        ),
+    )
+    parser.add_argument(
+        "--dense-min-frame-gap",
+        type=int,
+        default=0,
+        help="Minimum tracked-frame gap for motion scheduler. 0 reuses --dense-frame-interval.",
+    )
+    parser.add_argument("--dense-translation-thresh-m", type=float, default=0.25)
+    parser.add_argument("--dense-rotation-thresh-deg", type=float, default=12.0)
+    parser.add_argument("--dense-pixel-motion-thresh", type=float, default=18.0)
+    parser.add_argument(
+        "--dense-submit-when-worker-idle",
+        action="store_true",
+        help="Only submit a dense window when the LingBot worker has no active or pending window.",
+    )
+    parser.add_argument(
+        "--pause-tracking-while-dense",
+        action="store_true",
+        help="Pause the main tracking/cuVSLAM loop while LingBot dense inference is active to reduce GPU contention.",
+    )
+    parser.add_argument(
+        "--dense-busy-tracking-policy",
+        choices=("none", "pause", "throttle"),
+        default="none",
+        help=(
+            "Tracking behavior while the LingBot dense worker is active. "
+            "none keeps tracking at full rate; pause blocks tracking until dense finishes; "
+            "throttle allows low-rate tracking while dense is busy."
+        ),
+    )
+    parser.add_argument(
+        "--dense-busy-tracking-min-interval-sec",
+        type=float,
+        default=1.0,
+        help="Minimum interval between tracking steps while dense is busy when --dense-busy-tracking-policy=throttle.",
     )
     parser.add_argument("--num-scale-frames", type=int, default=2)
     parser.add_argument("--max-queue", type=int, default=2)
@@ -171,6 +292,16 @@ def parse_args() -> argparse.Namespace:
             "inverse matches the official depth unprojection path where extrinsic is world-to-camera."
         ),
     )
+    parser.add_argument(
+        "--lingbot-enable-camera",
+        action="store_true",
+        help="Enable LingBot camera/pose prediction head in the dense worker.",
+    )
+    parser.add_argument(
+        "--prefer-lingbot-pose",
+        action="store_true",
+        help="Use LingBot predicted extrinsics for dense fusion before external cuVSLAM/OpenCV poses.",
+    )
     parser.add_argument("--min-depth", type=float, default=0.1)
     parser.add_argument("--max-depth", type=float, default=80.0)
     parser.add_argument("--min-conf", type=float, default=1.0)
@@ -182,6 +313,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voxel-size", type=float, default=0.08)
     parser.add_argument("--fusion-max-points", type=int, default=500000)
     parser.add_argument("--fusion-min-observations", type=int, default=1)
+    parser.add_argument("--rolling-map", action="store_true", help="Use rolling local colored point cloud map backend.")
+    parser.add_argument("--rolling-map-voxel-size", type=float, default=0.06)
+    parser.add_argument("--rolling-map-radius-m", type=float, default=0.12)
+    parser.add_argument("--rolling-map-min-neighbors", type=int, default=2)
+    parser.add_argument("--rolling-map-max-windows", type=int, default=8)
+    parser.add_argument("--rolling-map-max-age-sec", type=float, default=30.0)
+    parser.add_argument("--rolling-map-max-points", type=int, default=180000)
+    parser.add_argument("--keyframe-translation-thresh-m", type=float, default=0.2)
+    parser.add_argument("--keyframe-rotation-thresh-deg", type=float, default=10.0)
+    parser.add_argument("--keyframe-time-thresh-sec", type=float, default=2.0)
+    parser.add_argument("--keyframe-max-count", type=int, default=200)
     parser.add_argument("--adaptive-sampling", action="store_true")
     parser.add_argument("--near-depth-m", type=float, default=18.0)
     parser.add_argument("--near-sample-stride", type=int, default=1)
@@ -198,6 +340,33 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use PyTorch SDPA instead of LingBot/FlashInfer attention. Default keeps the faster LingBot demo path.",
     )
+    parser.add_argument(
+        "--offload-to-cpu",
+        dest="offload_to_cpu",
+        action="store_true",
+        default=True,
+        help="Ask LingBot inference to move predictions to CPU during forward.",
+    )
+    parser.add_argument(
+        "--no-offload-to-cpu",
+        dest="offload_to_cpu",
+        action="store_false",
+        help="Keep LingBot intermediate predictions on GPU until postprocess/numpy export.",
+    )
+    parser.add_argument("--preload-lingbot-model", action="store_true")
+    parser.add_argument("--warmup-first-window", action="store_true")
+    parser.add_argument(
+        "--compile-lingbot-model",
+        action="store_true",
+        help="Compile LingBot hot modules and run CUDA-graph warmup on the first dense window.",
+    )
+    parser.add_argument("--compile-warmup-passes", type=int, default=3)
+    parser.add_argument("--compile-warmup-stream-frames", type=int, default=10)
+    parser.add_argument(
+        "--persistent-lingbot-streaming",
+        action="store_true",
+        help="Keep LingBot KV cache across dense windows and only forward the latest frame after scale initialization.",
+    )
     parser.add_argument("--model-patch-embed", default="")
     parser.add_argument("--model-embed-dim", type=int, default=0)
     parser.add_argument("--model-depth", type=int, default=0)
@@ -208,6 +377,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-sec", type=float, default=0.1)
     parser.add_argument("--publish-every-windows", type=int, default=1)
     parser.add_argument("--publish-every-frames", type=int, default=1)
+    parser.add_argument(
+        "--async-artifact-writer",
+        dest="async_artifact_writer",
+        action="store_true",
+        default=True,
+        help="Write live_map and debug PLY artifacts from a background latest-only writer.",
+    )
+    parser.add_argument(
+        "--no-async-artifact-writer",
+        dest="async_artifact_writer",
+        action="store_false",
+        help="Write live artifacts synchronously on the main live path.",
+    )
+    parser.add_argument("--artifact-writer-max-jobs", type=int, default=4)
+    parser.add_argument(
+        "--binary-cloud-ws-port",
+        type=int,
+        default=0,
+        help="Publish latest colored point cloud over a custom binary WebSocket. 0 disables it.",
+    )
+    parser.add_argument("--binary-cloud-ws-host", default="0.0.0.0")
+    parser.add_argument("--binary-cloud-max-points", type=int, default=60000)
+    parser.add_argument(
+        "--global-map",
+        action="store_true",
+        help="Maintain a persistent voxelized global colored point map in addition to the rolling local map.",
+    )
+    parser.add_argument("--global-map-voxel-size", type=float, default=0.08)
+    parser.add_argument("--global-map-radius-m", type=float, default=0.14)
+    parser.add_argument("--global-map-min-neighbors", type=int, default=1)
+    parser.add_argument("--global-map-max-points", type=int, default=300000)
+    parser.add_argument(
+        "--global-binary-cloud-ws-port",
+        type=int,
+        default=0,
+        help="Publish the persistent global colored point cloud over a second binary WebSocket. 0 disables it.",
+    )
+    parser.add_argument("--global-binary-cloud-max-points", type=int, default=120000)
     parser.add_argument("--ros2-publish", action="store_true", help="Publish the live HikRobot image and fused cloud to ROS2.")
     parser.add_argument("--ros2-image-topic", default="/hikrobot/image_raw")
     parser.add_argument("--ros2-camera-info-topic", default="/hikrobot/camera_info")
@@ -225,6 +432,15 @@ def parse_args() -> argparse.Namespace:
         "--ros2-republish-current-cloud-on-image",
         action="store_true",
         help="Republish the most recent current cloud after each image publish so RViz gets image-rate stamps.",
+    )
+    parser.add_argument(
+        "--ros2-current-cloud-republish-interval-sec",
+        type=float,
+        default=1.0,
+        help=(
+            "Minimum interval for image-triggered current-cloud republishes. "
+            "Keeps rosbridge/WebUI RGB responsive while still replaying the latest cloud."
+        ),
     )
     parser.add_argument(
         "--ros2-image-max-width",
@@ -282,6 +498,8 @@ class ROS2LiveBridge:
         image_max_width: int,
         image_max_height: int,
         republish_current_cloud_on_image: bool,
+        current_cloud_republish_interval_sec: float,
+        rgb_preview_dir: Path | None,
         path_max_poses: int,
     ) -> None:
         import rclpy
@@ -318,9 +536,15 @@ class ROS2LiveBridge:
         self.image_max_width = int(image_max_width)
         self.image_max_height = int(image_max_height)
         self.republish_current_cloud_on_image = bool(republish_current_cloud_on_image)
+        self.current_cloud_republish_interval_sec = max(0.0, float(current_cloud_republish_interval_sec))
+        self.rgb_preview_dir = rgb_preview_dir
+        if self.rgb_preview_dir is not None:
+            self.rgb_preview_dir.mkdir(parents=True, exist_ok=True)
         self.path_max_poses = int(path_max_poses)
         self._last_current_xyz: np.ndarray | None = None
         self._last_current_rgb: np.ndarray | None = None
+        self._last_current_stamp: Any | None = None
+        self._last_current_republish_sec = 0.0
         self._lock = threading.Lock()
         self.fields = [
             PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
@@ -379,6 +603,7 @@ class ROS2LiveBridge:
             K_msg[0, :] *= scale
             K_msg[1, :] *= scale
         height, width = rgb.shape[:2]
+        self._write_rgb_preview(rgb)
         with self._lock:
             stamp = self.node.get_clock().now().to_msg()
             image = self.Image()
@@ -409,14 +634,40 @@ class ROS2LiveBridge:
                 and self._last_current_xyz is not None
                 and self._last_current_rgb is not None
             ):
-                self._publish_cloud_locked(
-                    self.current_cloud_pub,
-                    self.current_plain_cloud_pub,
-                    self._last_current_xyz,
-                    self._last_current_rgb,
-                    max_points=self.max_current_cloud_points,
-                )
+                now_sec = time.perf_counter()
+                if (
+                    self._last_current_republish_sec <= 0.0
+                    or self.current_cloud_republish_interval_sec <= 0.0
+                    or now_sec - self._last_current_republish_sec >= self.current_cloud_republish_interval_sec
+                ):
+                    self._last_current_republish_sec = now_sec
+                    self._publish_cloud_locked(
+                        self.current_cloud_pub,
+                        self.current_plain_cloud_pub,
+                        self._last_current_xyz,
+                        self._last_current_rgb,
+                        max_points=self.max_current_cloud_points,
+                        stamp=self._last_current_stamp,
+                    )
             self.rclpy.spin_once(self.node, timeout_sec=0.0)
+
+    def _write_rgb_preview(self, rgb: np.ndarray) -> None:
+        if self.rgb_preview_dir is None:
+            return
+        try:
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                rgb[:, :, ::-1],
+                [int(cv2.IMWRITE_JPEG_QUALITY), 78],
+            )
+            if not ok:
+                return
+            tmp_path = self.rgb_preview_dir / "latest.jpg.tmp"
+            out_path = self.rgb_preview_dir / "latest.jpg"
+            tmp_path.write_bytes(encoded.tobytes())
+            tmp_path.replace(out_path)
+        except Exception:
+            return
 
     def publish_cloud(self, xyz: np.ndarray, rgb: np.ndarray) -> None:
         if self.cloud_pub is None:
@@ -437,12 +688,15 @@ class ROS2LiveBridge:
         self._last_current_xyz = np.asarray(xyz, dtype=np.float32).copy()
         self._last_current_rgb = np.asarray(rgb, dtype=np.uint8).copy()
         with self._lock:
+            self._last_current_stamp = self.node.get_clock().now().to_msg()
+            self._last_current_republish_sec = time.perf_counter()
             self._publish_cloud_locked(
                 self.current_cloud_pub,
                 self.current_plain_cloud_pub,
                 self._last_current_xyz,
                 self._last_current_rgb,
                 max_points=self.max_current_cloud_points,
+                stamp=self._last_current_stamp,
             )
             self.rclpy.spin_once(self.node, timeout_sec=0.0)
 
@@ -454,6 +708,7 @@ class ROS2LiveBridge:
         rgb: np.ndarray,
         *,
         max_points: int,
+        stamp: Any | None = None,
     ) -> None:
         if cloud_pub is None:
             return
@@ -475,7 +730,7 @@ class ROS2LiveBridge:
             cloud[:, :3] = xyz
             cloud[:, 3] = self._pack_rgb(rgb)
         header = Header()
-        header.stamp = self.node.get_clock().now().to_msg()
+        header.stamp = stamp if stamp is not None else self.node.get_clock().now().to_msg()
         header.frame_id = self.cloud_frame_id
         msg = point_cloud2.create_cloud(header=header, fields=self.fields, points=cloud)
         cloud_pub.publish(msg)
@@ -536,21 +791,42 @@ class HikRobotMonocularRGBAdapter:
         read_error_sleep_sec: float,
         threaded_capture: bool,
         capture_queue_size: int,
+        async_tracking: bool,
+        tracking_queue_size: int,
+        tracking_idle_fps: float,
+        tracking_dense_fps: float,
         intrinsic_args: tuple[float, float, float, float],
         config: Any,
+        distortion_coeffs: str = "",
+        undistort_camera: bool = False,
         fixed_step_scale: float = 0.08,
         frame_step: int = 1,
         max_frames: int = 0,
         frame_callback: Callable[[np.ndarray, np.ndarray, float], None] | None = None,
+        disable_cuvslam: bool = False,
     ) -> None:
         from hikrobot_mvs_ros2_publisher import HikRobotCamera
 
-        try:
-            import cuvslam  # type: ignore
-        except Exception:
+        cuvslam_import_error: Exception | None = None
+        if disable_cuvslam:
             cuvslam = None
+        else:
+            cuvslam_pythonpath = os.environ.get("CUVSLAM_PYTHONPATH", "").strip()
+            if cuvslam_pythonpath:
+                for raw_path in cuvslam_pythonpath.split(os.pathsep):
+                    if raw_path and raw_path not in sys.path:
+                        sys.path.append(raw_path)
+            try:
+                import cuvslam  # type: ignore
+            except Exception as exc:
+                cuvslam = None
+                cuvslam_import_error = exc
+            else:
+                print(f"cuVSLAM import path: {getattr(cuvslam, '__file__', '<unknown>')}", flush=True)
 
         self.output_dir = Path(output_dir).expanduser().resolve()
+        self.source_name = "hikrobot_mono_rgb"
+        self.log_name = "HikRobot"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.times_path = self.output_dir / "times.txt"
         self.calib_path = self.output_dir / "calib.txt"
@@ -564,6 +840,13 @@ class HikRobotMonocularRGBAdapter:
         self._capture_queue: queue.Queue[tuple[int, float, np.ndarray]] = queue.Queue(maxsize=self.capture_queue_size)
         self._capture_stop = threading.Event()
         self._capture_thread: threading.Thread | None = None
+        self.async_tracking = bool(async_tracking)
+        self.tracking_queue_size = max(1, int(tracking_queue_size))
+        self.tracking_idle_fps = max(0.0, float(tracking_idle_fps))
+        self.tracking_dense_fps = max(0.0, float(tracking_dense_fps))
+        self._tracking_queue: queue.Queue[TrackingOutput] = queue.Queue(maxsize=self.tracking_queue_size)
+        self._tracking_thread: threading.Thread | None = None
+        self._dense_busy_callback: Callable[[], bool] | None = None
         self.config = config
         self.fixed_step_scale = float(fixed_step_scale)
         self.orb = cv2.ORB_create(nfeatures=config.max_features)
@@ -575,7 +858,7 @@ class HikRobotMonocularRGBAdapter:
         self._last_keyframe_idx = -10**9
         self._last_pose = np.eye(4, dtype=np.float32)
         self._start = time.perf_counter()
-        self._odometry_mode = "OpenCV Essential"
+        self._odometry_mode = "OpenCV Essential (cuVSLAM disabled)" if disable_cuvslam else "OpenCV Essential"
 
         print(
             f"Opening HikRobot camera index={camera_index} timeout_ms={timeout_ms} "
@@ -600,6 +883,32 @@ class HikRobotMonocularRGBAdapter:
         cx = float(cx_arg or width / 2.0)
         cy = float(cy_arg or height / 2.0)
         self.K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+        self.raw_K = self.K.copy()
+        distortion_values = _parse_float_list(distortion_coeffs)
+        if distortion_values and len(distortion_values) < 5:
+            distortion_values = distortion_values + [0.0] * (5 - len(distortion_values))
+        self.distortion_coeffs = np.asarray(distortion_values[:5], dtype=np.float32) if distortion_values else None
+        self.undistort_camera = bool(undistort_camera and self.distortion_coeffs is not None)
+        self._undistort_map: tuple[np.ndarray, np.ndarray] | None = None
+        if self.undistort_camera and self.distortion_coeffs is not None:
+            new_K, _ = cv2.getOptimalNewCameraMatrix(
+                self.raw_K,
+                self.distortion_coeffs,
+                (self.width, self.height),
+                0.0,
+                (self.width, self.height),
+            )
+            map1, map2 = cv2.initUndistortRectifyMap(
+                self.raw_K,
+                self.distortion_coeffs,
+                None,
+                new_K,
+                (self.width, self.height),
+                cv2.CV_16SC2,
+            )
+            self.K = new_K.astype(np.float32)
+            self._undistort_map = (map1, map2)
+            self._pending_rgb = self._prepare_rgb(self._pending_rgb)
         self._write_calib_and_times_header()
 
         self.tracker = None
@@ -608,7 +917,13 @@ class HikRobotMonocularRGBAdapter:
             camera.size = [self.width, self.height]
             camera.focal = [float(self.K[0, 0]), float(self.K[1, 1])]
             camera.principal = [float(self.K[0, 2]), float(self.K[1, 2])]
-            camera.distortion = cuvslam.Distortion(cuvslam.Distortion.Model.Pinhole, [])
+            if self.distortion_coeffs is not None and not self.undistort_camera:
+                camera.distortion = cuvslam.Distortion(
+                    cuvslam.Distortion.Model.Brown,
+                    [float(v) for v in self.distortion_coeffs[:5]],
+                )
+            else:
+                camera.distortion = cuvslam.Distortion(cuvslam.Distortion.Model.Pinhole, [])
             camera.border_top = 10
             camera.border_bottom = 10
             camera.border_left = 10
@@ -619,9 +934,17 @@ class HikRobotMonocularRGBAdapter:
                 cfg.odometry_mode = cuvslam.Tracker.OdometryMode.Mono
                 self.tracker = cuvslam.Tracker(rig, cfg)
                 self._odometry_mode = "cuVSLAM Mono"
+        elif cuvslam_import_error is not None:
+            print(
+                f"cuVSLAM import failed; falling back to OpenCV Essential: "
+                f"{type(cuvslam_import_error).__name__}: {cuvslam_import_error}",
+                flush=True,
+            )
         print(
             f"HikRobot stream opened: {self.width}x{self.height}, "
-            f"fx={self.K[0, 0]:.2f}, fy={self.K[1, 1]:.2f}, odometry={self._odometry_mode}",
+            f"fx={self.K[0, 0]:.2f}, fy={self.K[1, 1]:.2f}, "
+            f"distortion={'yes' if self.distortion_coeffs is not None else 'no'}, "
+            f"undistort={'yes' if self.undistort_camera else 'no'}, odometry={self._odometry_mode}",
             flush=True,
         )
 
@@ -629,9 +952,25 @@ class HikRobotMonocularRGBAdapter:
         self._capture_stop.set()
         if self._capture_thread is not None and self._capture_thread.is_alive():
             self._capture_thread.join(timeout=2.0)
+        if self._tracking_thread is not None and self._tracking_thread.is_alive():
+            self._tracking_thread.join(timeout=2.0)
         self.camera.close()
 
+    def set_dense_busy_callback(self, callback: Callable[[], bool]) -> None:
+        self._dense_busy_callback = callback
+
+    def _prepare_rgb(self, rgb: np.ndarray) -> np.ndarray:
+        if self._undistort_map is None:
+            return rgb
+        map1, map2 = self._undistort_map
+        return cv2.remap(rgb, map1, map2, cv2.INTER_LINEAR)
+
     def __iter__(self):
+        if self.threaded_capture and self.async_tracking:
+            self._start_capture_thread()
+            self._start_tracking_thread()
+            yield from self._iter_async_tracking()
+            return
         if self.threaded_capture:
             self._start_capture_thread()
             yield from self._iter_threaded()
@@ -648,7 +987,7 @@ class HikRobotMonocularRGBAdapter:
                     except RuntimeError as exc:
                         consecutive_read_errors += 1
                         print(
-                            f"Warning: HikRobot read failed ({consecutive_read_errors}/"
+                            f"Warning: {self.log_name} read failed ({consecutive_read_errors}/"
                             f"{self.max_read_errors}): {exc}",
                             flush=True,
                         )
@@ -658,6 +997,7 @@ class HikRobotMonocularRGBAdapter:
                         continue
                     consecutive_read_errors = 0
                     rgb = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(height, width, 3).copy()
+                    rgb = self._prepare_rgb(rgb)
                 timestamp_sec = time.perf_counter() - self._start
                 if self.frame_callback is not None:
                     self.frame_callback(rgb, self.K, timestamp_sec)
@@ -674,7 +1014,19 @@ class HikRobotMonocularRGBAdapter:
         self._capture_thread = threading.Thread(target=self._capture_loop, name="hikrobot-capture", daemon=True)
         self._capture_thread.start()
         print(
-            f"HikRobot threaded capture enabled: queue_size={self.capture_queue_size}",
+            f"{self.log_name} threaded capture enabled: queue_size={self.capture_queue_size}",
+            flush=True,
+        )
+
+    def _start_tracking_thread(self) -> None:
+        if self._tracking_thread is not None:
+            return
+        self._tracking_thread = threading.Thread(target=self._tracking_loop, name="hikrobot-tracking", daemon=True)
+        self._tracking_thread.start()
+        print(
+            f"{self.log_name} async tracking enabled: "
+            f"queue_size={self.tracking_queue_size} idle_fps={self.tracking_idle_fps:.2f} "
+            f"dense_fps={self.tracking_dense_fps:.2f}",
             flush=True,
         )
 
@@ -688,10 +1040,11 @@ class HikRobotMonocularRGBAdapter:
                 else:
                     rgb_bytes, width, height = self.camera.read_rgb()
                     rgb = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(height, width, 3).copy()
+                    rgb = self._prepare_rgb(rgb)
             except RuntimeError as exc:
                 consecutive_read_errors += 1
                 print(
-                    f"Warning: HikRobot capture read failed ({consecutive_read_errors}/"
+                    f"Warning: {self.log_name} capture read failed ({consecutive_read_errors}/"
                     f"{self.max_read_errors}): {exc}",
                     flush=True,
                 )
@@ -718,6 +1071,67 @@ class HikRobotMonocularRGBAdapter:
                     self._capture_queue.get_nowait()
                 except queue.Empty:
                     pass
+
+    def _put_tracking_output(self, item: TrackingOutput) -> None:
+        while not self._capture_stop.is_set():
+            try:
+                self._tracking_queue.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    self._tracking_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _tracking_loop(self) -> None:
+        processed = 0
+        last_track_sec = 0.0
+        try:
+            while not self._capture_stop.is_set() and (self.max_frames <= 0 or processed < self.max_frames):
+                try:
+                    frame_idx, timestamp_sec, rgb = self._capture_queue.get(timeout=1.0)
+                except queue.Empty:
+                    if self._capture_stop.is_set():
+                        break
+                    continue
+                if frame_idx % self.frame_step != 0:
+                    continue
+                dense_busy = bool(self._dense_busy_callback() if self._dense_busy_callback is not None else False)
+                target_fps = self.tracking_dense_fps if dense_busy else self.tracking_idle_fps
+                if target_fps <= 0.0:
+                    continue
+                now = time.perf_counter()
+                min_interval = 1.0 / max(1e-6, target_fps)
+                if last_track_sec > 0.0 and now - last_track_sec < min_interval:
+                    continue
+                last_track_sec = now
+                self._append_time(timestamp_sec)
+                output = self._build_output(frame_idx, timestamp_sec, rgb)
+                output.notes = dict(output.notes or {})
+                output.notes["async_tracking"] = True
+                output.notes["tracking_dense_busy"] = dense_busy
+                output.notes["tracking_target_fps"] = target_fps
+                processed += 1
+                self._put_tracking_output(output)
+        finally:
+            if self.max_frames > 0:
+                self._capture_stop.set()
+
+    def _iter_async_tracking(self):
+        yielded = 0
+        try:
+            while self.max_frames <= 0 or yielded < self.max_frames:
+                try:
+                    item = self._tracking_queue.get(timeout=1.0)
+                except queue.Empty:
+                    tracking_done = self._tracking_thread is not None and not self._tracking_thread.is_alive()
+                    if self._capture_stop.is_set() or tracking_done:
+                        break
+                    continue
+                yielded += 1
+                yield item
+        finally:
+            self.close()
 
     def _iter_threaded(self):
         processed = 0
@@ -792,10 +1206,17 @@ class HikRobotMonocularRGBAdapter:
         self._prev_gray = gray
         self._prev_pose = pose
         notes = {
-            "source": "hikrobot_mono_rgb",
+            "source": self.source_name,
             "odometry_mode": self._odometry_mode,
             "rgb_output_dir": str(self.output_dir),
+            "camera_fx": float(self.K[0, 0]),
+            "camera_fy": float(self.K[1, 1]),
+            "camera_cx": float(self.K[0, 2]),
+            "camera_cy": float(self.K[1, 2]),
+            "camera_undistorted": bool(self.undistort_camera),
         }
+        if self.distortion_coeffs is not None:
+            notes["camera_distortion_coeffs"] = [float(v) for v in self.distortion_coeffs[:5]]
         if not track_ok:
             notes["warning"] = "cuvslam_world_from_rig_missing_reusing_last_pose"
         return TrackingOutput(
@@ -912,6 +1333,532 @@ class HikRobotMonocularRGBAdapter:
         if not keypoints:
             return np.zeros((0, 2), dtype=np.float32)
         return np.array([kp.pt for kp in keypoints], dtype=np.float32)
+
+
+class _RealSenseRGBCamera:
+    """Tiny pyrealsense2 color-camera shim matching the HikRobotCamera read API."""
+
+    def __init__(
+        self,
+        *,
+        device_index: int,
+        serial: str,
+        timeout_ms: int,
+        width: int,
+        height: int,
+        fps: float,
+    ) -> None:
+        try:
+            import pyrealsense2 as rs  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on local SDK.
+            raise RuntimeError(
+                "pyrealsense2 is not available. Install RealSense support first, e.g. "
+                "`sudo apt install ros-humble-realsense2-camera` and/or a Jetson-compatible pyrealsense2."
+            ) from exc
+
+        self.rs = rs
+        self.timeout_ms = int(timeout_ms)
+        self.pipeline = rs.pipeline()
+        cfg = rs.config()
+        serial = str(serial or "").strip()
+        if serial:
+            cfg.enable_device(serial)
+        else:
+            ctx = rs.context()
+            devices = list(ctx.query_devices())
+            if not devices:
+                raise RuntimeError("No Intel RealSense devices found.")
+            idx = min(max(int(device_index), 0), len(devices) - 1)
+            selected_serial = devices[idx].get_info(rs.camera_info.serial_number)
+            cfg.enable_device(selected_serial)
+        self.width = int(width or 640)
+        self.height = int(height or 480)
+        self.fps = int(round(float(fps or 30.0)))
+        cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
+        self.profile = self.pipeline.start(cfg)
+        stream_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+        self.intrinsics = stream_profile.get_intrinsics()
+        self.width = int(self.intrinsics.width)
+        self.height = int(self.intrinsics.height)
+
+    def read_rgb(self) -> tuple[bytes, int, int]:
+        frames = self.pipeline.wait_for_frames(self.timeout_ms)
+        color = frames.get_color_frame()
+        if not color:
+            raise RuntimeError("RealSense color frame missing")
+        rgb = np.asanyarray(color.get_data())
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise RuntimeError(f"Unexpected RealSense color shape: {rgb.shape}")
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        return rgb.tobytes(), int(rgb.shape[1]), int(rgb.shape[0])
+
+    def close(self) -> None:
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
+
+
+class ROS2MonocularRGBAdapter(HikRobotMonocularRGBAdapter):
+    """Live ROS2 Image source with cuVSLAM Mono poses and on-disk frames for LingBot."""
+
+    def __init__(
+        self,
+        *,
+        output_dir: str | Path,
+        image_topic: str,
+        camera_info_topic: str,
+        timeout_ms: int,
+        max_read_errors: int,
+        read_error_sleep_sec: float,
+        capture_queue_size: int,
+        async_tracking: bool,
+        tracking_queue_size: int,
+        tracking_idle_fps: float,
+        tracking_dense_fps: float,
+        intrinsic_args: tuple[float, float, float, float],
+        config: Any,
+        distortion_coeffs: str = "",
+        undistort_camera: bool = False,
+        fixed_step_scale: float = 0.08,
+        frame_step: int = 1,
+        max_frames: int = 0,
+        frame_callback: Callable[[np.ndarray, np.ndarray, float], None] | None = None,
+        disable_cuvslam: bool = False,
+        source_name: str = "ros2_mono_rgb",
+        log_name: str = "ROS2 image",
+    ) -> None:
+        cuvslam_import_error: Exception | None = None
+        if disable_cuvslam:
+            cuvslam = None
+        else:
+            cuvslam_pythonpath = os.environ.get("CUVSLAM_PYTHONPATH", "").strip()
+            if cuvslam_pythonpath:
+                for raw_path in cuvslam_pythonpath.split(os.pathsep):
+                    if raw_path and raw_path not in sys.path:
+                        sys.path.append(raw_path)
+            try:
+                import cuvslam  # type: ignore
+            except Exception as exc:
+                cuvslam = None
+                cuvslam_import_error = exc
+            else:
+                print(f"cuVSLAM import path: {getattr(cuvslam, '__file__', '<unknown>')}", flush=True)
+
+        import rclpy
+        from rclpy.node import Node
+        from sensor_msgs.msg import CameraInfo, Image
+
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        self.rclpy = rclpy
+        self.Image = Image
+        self.CameraInfo = CameraInfo
+        self._ros_node = Node("lingbot_live_ros2_image_source")
+        self._ros_image_topic = str(image_topic)
+        self._ros_camera_info_topic = str(camera_info_topic)
+        self._last_camera_info: Any | None = None
+        self._latest_capture: tuple[int, float, np.ndarray] | None = None
+        self._capture_lock = threading.Lock()
+        self._next_frame_idx = 0
+        self._first_ros_stamp_sec: float | None = None
+        self._ros_node.create_subscription(Image, self._ros_image_topic, self._on_ros_image, 4)
+        if self._ros_camera_info_topic:
+            self._ros_node.create_subscription(CameraInfo, self._ros_camera_info_topic, self._on_ros_camera_info, 4)
+
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.source_name = source_name
+        self.log_name = log_name
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.times_path = self.output_dir / "times.txt"
+        self.calib_path = self.output_dir / "calib.txt"
+        self.frame_step = max(1, int(frame_step))
+        self.max_frames = int(max_frames)
+        self.frame_callback = frame_callback
+        self.max_read_errors = int(max_read_errors)
+        self.read_error_sleep_sec = float(read_error_sleep_sec)
+        self.threaded_capture = True
+        self.capture_queue_size = max(1, int(capture_queue_size))
+        self._capture_queue: queue.Queue[tuple[int, float, np.ndarray]] = queue.Queue(maxsize=self.capture_queue_size)
+        self._capture_stop = threading.Event()
+        self._capture_thread: threading.Thread | None = None
+        self.async_tracking = bool(async_tracking)
+        self.tracking_queue_size = max(1, int(tracking_queue_size))
+        self.tracking_idle_fps = max(0.0, float(tracking_idle_fps))
+        self.tracking_dense_fps = max(0.0, float(tracking_dense_fps))
+        self._tracking_queue: queue.Queue[TrackingOutput] = queue.Queue(maxsize=self.tracking_queue_size)
+        self._tracking_thread: threading.Thread | None = None
+        self._dense_busy_callback: Callable[[], bool] | None = None
+        self.config = config
+        self.fixed_step_scale = float(fixed_step_scale)
+        self.orb = cv2.ORB_create(nfeatures=config.max_features)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self._prev_keypoints: list | None = None
+        self._prev_descriptors: np.ndarray | None = None
+        self._prev_gray: np.ndarray | None = None
+        self._prev_pose: np.ndarray | None = None
+        self._last_keyframe_idx = -10**9
+        self._last_pose = np.eye(4, dtype=np.float32)
+        self._start = time.perf_counter()
+        self._odometry_mode = "OpenCV Essential (cuVSLAM disabled)" if disable_cuvslam else "OpenCV Essential"
+
+        print(
+            f"Waiting for {log_name} topic image={self._ros_image_topic} "
+            f"camera_info={self._ros_camera_info_topic or '(none)'}",
+            flush=True,
+        )
+        deadline = time.perf_counter() + max(2.0, float(timeout_ms) / 1000.0)
+        while time.perf_counter() < deadline:
+            self.rclpy.spin_once(self._ros_node, timeout_sec=0.1)
+            with self._capture_lock:
+                latest = self._latest_capture
+                info = self._last_camera_info
+            if latest is not None and (info is not None or not self._ros_camera_info_topic):
+                break
+        with self._capture_lock:
+            latest = self._latest_capture
+            info = self._last_camera_info
+        if latest is None:
+            raise RuntimeError(f"No image received on {self._ros_image_topic}")
+        _, _, self._pending_rgb = latest
+        self.height, self.width = self._pending_rgb.shape[:2]
+        fx_arg, fy_arg, cx_arg, cy_arg = intrinsic_args
+        if info is not None:
+            k = np.asarray(info.k, dtype=np.float32).reshape(3, 3)
+            fx_default, fy_default, cx_default, cy_default = float(k[0, 0]), float(k[1, 1]), float(k[0, 2]), float(k[1, 2])
+        else:
+            fx_default, fy_default, cx_default, cy_default = float(self.width), float(self.width), float(self.width / 2.0), float(self.height / 2.0)
+            print(f"Warning: no CameraInfo received; using fallback pinhole intrinsics for {log_name}", flush=True)
+        fx = float(fx_arg or fx_default)
+        fy = float(fy_arg or fy_default)
+        cx = float(cx_arg or cx_default)
+        cy = float(cy_arg or cy_default)
+        self.K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+        self.raw_K = self.K.copy()
+        distortion_values = _parse_float_list(distortion_coeffs)
+        if not distortion_values and info is not None:
+            distortion_values = [float(v) for v in list(info.d)[:5]]
+        if distortion_values and len(distortion_values) < 5:
+            distortion_values = distortion_values + [0.0] * (5 - len(distortion_values))
+        if distortion_values and max(abs(float(v)) for v in distortion_values[:5]) > 1e-12:
+            self.distortion_coeffs = np.asarray(distortion_values[:5], dtype=np.float32)
+        else:
+            self.distortion_coeffs = None
+        self.undistort_camera = bool(undistort_camera and self.distortion_coeffs is not None)
+        self._undistort_map: tuple[np.ndarray, np.ndarray] | None = None
+        if self.undistort_camera and self.distortion_coeffs is not None:
+            new_K, _ = cv2.getOptimalNewCameraMatrix(
+                self.raw_K,
+                self.distortion_coeffs,
+                (self.width, self.height),
+                0.0,
+                (self.width, self.height),
+            )
+            map1, map2 = cv2.initUndistortRectifyMap(
+                self.raw_K,
+                self.distortion_coeffs,
+                None,
+                new_K,
+                (self.width, self.height),
+                cv2.CV_16SC2,
+            )
+            self.K = new_K.astype(np.float32)
+            self._undistort_map = (map1, map2)
+            self._pending_rgb = self._prepare_rgb(self._pending_rgb)
+        self._write_calib_and_times_header()
+
+        self.tracker = None
+        if cuvslam is not None:
+            camera = cuvslam.Camera()
+            camera.size = [self.width, self.height]
+            camera.focal = [float(self.K[0, 0]), float(self.K[1, 1])]
+            camera.principal = [float(self.K[0, 2]), float(self.K[1, 2])]
+            if self.distortion_coeffs is not None and not self.undistort_camera:
+                camera.distortion = cuvslam.Distortion(
+                    cuvslam.Distortion.Model.Brown,
+                    [float(v) for v in self.distortion_coeffs[:5]],
+                )
+            else:
+                camera.distortion = cuvslam.Distortion(cuvslam.Distortion.Model.Pinhole, [])
+            camera.border_top = 10
+            camera.border_bottom = 10
+            camera.border_left = 10
+            camera.border_right = 10
+            rig = cuvslam.Rig([camera])
+            cfg = cuvslam.Tracker.OdometryConfig()
+            if hasattr(cuvslam.Tracker.OdometryMode, "Mono"):
+                cfg.odometry_mode = cuvslam.Tracker.OdometryMode.Mono
+                self.tracker = cuvslam.Tracker(rig, cfg)
+                self._odometry_mode = "cuVSLAM Mono"
+        elif cuvslam_import_error is not None:
+            print(
+                f"cuVSLAM import failed; falling back to OpenCV Essential: "
+                f"{type(cuvslam_import_error).__name__}: {cuvslam_import_error}",
+                flush=True,
+            )
+        print(
+            f"{log_name} stream opened: {self.width}x{self.height}, "
+            f"fx={self.K[0, 0]:.2f}, fy={self.K[1, 1]:.2f}, "
+            f"distortion={'yes' if self.distortion_coeffs is not None else 'no'}, "
+            f"undistort={'yes' if self.undistort_camera else 'no'}, odometry={self._odometry_mode}",
+            flush=True,
+        )
+
+    def close(self) -> None:
+        self._capture_stop.set()
+        if self._capture_thread is not None and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=2.0)
+        if self._tracking_thread is not None and self._tracking_thread.is_alive():
+            self._tracking_thread.join(timeout=2.0)
+        try:
+            self._ros_node.destroy_node()
+        except Exception:
+            pass
+
+    def _on_ros_camera_info(self, msg: Any) -> None:
+        with self._capture_lock:
+            self._last_camera_info = msg
+
+    def _on_ros_image(self, msg: Any) -> None:
+        rgb = self._image_msg_to_rgb(msg)
+        raw_timestamp_sec = self._stamp_to_sec(msg.header.stamp)
+        if raw_timestamp_sec > 0.0:
+            if self._first_ros_stamp_sec is None:
+                self._first_ros_stamp_sec = raw_timestamp_sec
+            timestamp_sec = raw_timestamp_sec - self._first_ros_stamp_sec
+        else:
+            timestamp_sec = time.perf_counter() - self._start
+        if getattr(self, "_undistort_map", None) is not None:
+            rgb = self._prepare_rgb(rgb)
+        with self._capture_lock:
+            frame_idx = self._next_frame_idx
+            self._next_frame_idx += 1
+            self._latest_capture = (frame_idx, float(timestamp_sec), rgb)
+        if self.frame_callback is not None and hasattr(self, "K"):
+            self.frame_callback(rgb, self.K, timestamp_sec)
+        self._put_capture_frame(frame_idx, timestamp_sec, rgb)
+
+    def _capture_loop(self) -> None:
+        consecutive_read_errors = 0
+        while not self._capture_stop.is_set():
+            try:
+                self.rclpy.spin_once(self._ros_node, timeout_sec=0.1)
+                consecutive_read_errors = 0
+            except Exception as exc:
+                consecutive_read_errors += 1
+                print(
+                    f"Warning: {self.log_name} ROS spin failed ({consecutive_read_errors}/"
+                    f"{self.max_read_errors}): {exc}",
+                    flush=True,
+                )
+                if self.max_read_errors > 0 and consecutive_read_errors >= self.max_read_errors:
+                    self._capture_stop.set()
+                    break
+                time.sleep(max(0.0, self.read_error_sleep_sec))
+
+    @staticmethod
+    def _stamp_to_sec(stamp: Any) -> float:
+        return float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) * 1e-9
+
+    @staticmethod
+    def _image_msg_to_rgb(msg: Any) -> np.ndarray:
+        encoding = str(getattr(msg, "encoding", "")).lower()
+        height = int(msg.height)
+        width = int(msg.width)
+        data = np.frombuffer(msg.data, dtype=np.uint8)
+        if encoding in {"rgb8", "bgr8"}:
+            arr = data.reshape(height, int(msg.step))[:, : width * 3].reshape(height, width, 3)
+            if encoding == "bgr8":
+                arr = arr[:, :, ::-1]
+            return np.ascontiguousarray(arr, dtype=np.uint8)
+        if encoding in {"mono8", "8uc1"}:
+            arr = data.reshape(height, int(msg.step))[:, :width]
+            return np.ascontiguousarray(np.repeat(arr[:, :, None], 3, axis=2), dtype=np.uint8)
+        if encoding in {"rgba8", "bgra8"}:
+            arr = data.reshape(height, int(msg.step))[:, : width * 4].reshape(height, width, 4)[:, :, :3]
+            if encoding == "bgra8":
+                arr = arr[:, :, ::-1]
+            return np.ascontiguousarray(arr, dtype=np.uint8)
+        raise RuntimeError(f"Unsupported ROS image encoding for live RGB: {msg.encoding}")
+
+
+class RealSenseMonocularRGBAdapter(HikRobotMonocularRGBAdapter):
+    """Live RealSense color source with cuVSLAM Mono poses and on-disk frames for LingBot."""
+
+    def __init__(
+        self,
+        *,
+        output_dir: str | Path,
+        camera_index: int,
+        serial: str,
+        timeout_ms: int,
+        fps: float | None,
+        capture_width: int,
+        capture_height: int,
+        max_read_errors: int,
+        read_error_sleep_sec: float,
+        threaded_capture: bool,
+        capture_queue_size: int,
+        async_tracking: bool,
+        tracking_queue_size: int,
+        tracking_idle_fps: float,
+        tracking_dense_fps: float,
+        intrinsic_args: tuple[float, float, float, float],
+        config: Any,
+        distortion_coeffs: str = "",
+        undistort_camera: bool = False,
+        fixed_step_scale: float = 0.08,
+        frame_step: int = 1,
+        max_frames: int = 0,
+        frame_callback: Callable[[np.ndarray, np.ndarray, float], None] | None = None,
+        disable_cuvslam: bool = False,
+    ) -> None:
+        cuvslam_import_error: Exception | None = None
+        if disable_cuvslam:
+            cuvslam = None
+        else:
+            cuvslam_pythonpath = os.environ.get("CUVSLAM_PYTHONPATH", "").strip()
+            if cuvslam_pythonpath:
+                for raw_path in cuvslam_pythonpath.split(os.pathsep):
+                    if raw_path and raw_path not in sys.path:
+                        sys.path.append(raw_path)
+            try:
+                import cuvslam  # type: ignore
+            except Exception as exc:
+                cuvslam = None
+                cuvslam_import_error = exc
+            else:
+                print(f"cuVSLAM import path: {getattr(cuvslam, '__file__', '<unknown>')}", flush=True)
+
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.source_name = "realsense_mono_rgb"
+        self.log_name = "RealSense"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.times_path = self.output_dir / "times.txt"
+        self.calib_path = self.output_dir / "calib.txt"
+        self.frame_step = max(1, int(frame_step))
+        self.max_frames = int(max_frames)
+        self.frame_callback = frame_callback
+        self.max_read_errors = int(max_read_errors)
+        self.read_error_sleep_sec = float(read_error_sleep_sec)
+        self.threaded_capture = bool(threaded_capture)
+        self.capture_queue_size = max(1, int(capture_queue_size))
+        self._capture_queue: queue.Queue[tuple[int, float, np.ndarray]] = queue.Queue(maxsize=self.capture_queue_size)
+        self._capture_stop = threading.Event()
+        self._capture_thread: threading.Thread | None = None
+        self.async_tracking = bool(async_tracking)
+        self.tracking_queue_size = max(1, int(tracking_queue_size))
+        self.tracking_idle_fps = max(0.0, float(tracking_idle_fps))
+        self.tracking_dense_fps = max(0.0, float(tracking_dense_fps))
+        self._tracking_queue: queue.Queue[TrackingOutput] = queue.Queue(maxsize=self.tracking_queue_size)
+        self._tracking_thread: threading.Thread | None = None
+        self._dense_busy_callback: Callable[[], bool] | None = None
+        self.config = config
+        self.fixed_step_scale = float(fixed_step_scale)
+        self.orb = cv2.ORB_create(nfeatures=config.max_features)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self._prev_keypoints: list | None = None
+        self._prev_descriptors: np.ndarray | None = None
+        self._prev_gray: np.ndarray | None = None
+        self._prev_pose: np.ndarray | None = None
+        self._last_keyframe_idx = -10**9
+        self._last_pose = np.eye(4, dtype=np.float32)
+        self._start = time.perf_counter()
+        self._odometry_mode = "OpenCV Essential (cuVSLAM disabled)" if disable_cuvslam else "OpenCV Essential"
+
+        print(
+            f"Opening RealSense color stream index={camera_index} serial={serial or '(auto)'} "
+            f"timeout_ms={timeout_ms} size={capture_width}x{capture_height} fps={fps}",
+            flush=True,
+        )
+        self.camera = _RealSenseRGBCamera(
+            device_index=camera_index,
+            serial=serial,
+            timeout_ms=timeout_ms,
+            width=capture_width,
+            height=capture_height,
+            fps=float(fps or 30.0),
+        )
+        first_rgb_bytes, width, height = self.camera.read_rgb()
+        self._pending_rgb = np.frombuffer(first_rgb_bytes, dtype=np.uint8).reshape(height, width, 3).copy()
+        self.height = int(height)
+        self.width = int(width)
+        fx_arg, fy_arg, cx_arg, cy_arg = intrinsic_args
+        fx = float(fx_arg or self.camera.intrinsics.fx)
+        fy = float(fy_arg or self.camera.intrinsics.fy)
+        cx = float(cx_arg or self.camera.intrinsics.ppx)
+        cy = float(cy_arg or self.camera.intrinsics.ppy)
+        self.K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+        self.raw_K = self.K.copy()
+        distortion_values = _parse_float_list(distortion_coeffs)
+        if not distortion_values:
+            coeffs = list(getattr(self.camera.intrinsics, "coeffs", []) or [])
+            distortion_values = [float(v) for v in coeffs[:5]]
+        if distortion_values and len(distortion_values) < 5:
+            distortion_values = distortion_values + [0.0] * (5 - len(distortion_values))
+        if distortion_values and max(abs(float(v)) for v in distortion_values[:5]) > 1e-12:
+            self.distortion_coeffs = np.asarray(distortion_values[:5], dtype=np.float32)
+        else:
+            self.distortion_coeffs = None
+        self.undistort_camera = bool(undistort_camera and self.distortion_coeffs is not None)
+        self._undistort_map: tuple[np.ndarray, np.ndarray] | None = None
+        if self.undistort_camera and self.distortion_coeffs is not None:
+            new_K, _ = cv2.getOptimalNewCameraMatrix(
+                self.raw_K,
+                self.distortion_coeffs,
+                (self.width, self.height),
+                0.0,
+                (self.width, self.height),
+            )
+            map1, map2 = cv2.initUndistortRectifyMap(
+                self.raw_K,
+                self.distortion_coeffs,
+                None,
+                new_K,
+                (self.width, self.height),
+                cv2.CV_16SC2,
+            )
+            self.K = new_K.astype(np.float32)
+            self._undistort_map = (map1, map2)
+            self._pending_rgb = self._prepare_rgb(self._pending_rgb)
+        self._write_calib_and_times_header()
+
+        self.tracker = None
+        if cuvslam is not None:
+            camera = cuvslam.Camera()
+            camera.size = [self.width, self.height]
+            camera.focal = [float(self.K[0, 0]), float(self.K[1, 1])]
+            camera.principal = [float(self.K[0, 2]), float(self.K[1, 2])]
+            if self.distortion_coeffs is not None and not self.undistort_camera:
+                camera.distortion = cuvslam.Distortion(
+                    cuvslam.Distortion.Model.Brown,
+                    [float(v) for v in self.distortion_coeffs[:5]],
+                )
+            else:
+                camera.distortion = cuvslam.Distortion(cuvslam.Distortion.Model.Pinhole, [])
+            camera.border_top = 10
+            camera.border_bottom = 10
+            camera.border_left = 10
+            camera.border_right = 10
+            rig = cuvslam.Rig([camera])
+            cfg = cuvslam.Tracker.OdometryConfig()
+            if hasattr(cuvslam.Tracker.OdometryMode, "Mono"):
+                cfg.odometry_mode = cuvslam.Tracker.OdometryMode.Mono
+                self.tracker = cuvslam.Tracker(rig, cfg)
+                self._odometry_mode = "cuVSLAM Mono"
+        elif cuvslam_import_error is not None:
+            print(
+                f"cuVSLAM import failed; falling back to OpenCV Essential: "
+                f"{type(cuvslam_import_error).__name__}: {cuvslam_import_error}",
+                flush=True,
+            )
+        print(
+            f"RealSense stream opened: {self.width}x{self.height}, "
+            f"fx={self.K[0, 0]:.2f}, fy={self.K[1, 1]:.2f}, "
+            f"distortion={'yes' if self.distortion_coeffs is not None else 'no'}, "
+            f"undistort={'yes' if self.undistort_camera else 'no'}, odometry={self._odometry_mode}",
+            flush=True,
+        )
 
 
 def _load_kitti_intrinsic(sequence_dir: Path, camera_index: int = 0) -> np.ndarray:
@@ -1316,6 +2263,15 @@ def _collect_live_arrays(
     return xyz, rgb, frames, semantic_label, semantic_conf, observations
 
 
+def _collect_batches_arrays(
+    batches: list[dict[str, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    frame_points: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
+    for idx, batch in enumerate(batches):
+        frame_points[idx] = batch
+    return _collect_live_arrays(frame_points)
+
+
 def _write_live_json(
     output_dir: Path,
     frame_points: OrderedDict[int, dict[str, np.ndarray]],
@@ -1365,6 +2321,10 @@ def _write_live_json(
         "events": events[-80:],
         "settings": {
             "tracking_backend": str(args.tracking_backend),
+            "hikrobot_disable_cuvslam": bool(getattr(args, "hikrobot_disable_cuvslam", False)),
+            "hikrobot_async_tracking": bool(getattr(args, "hikrobot_async_tracking", False)),
+            "realsense_disable_cuvslam": bool(getattr(args, "realsense_disable_cuvslam", False)),
+            "realsense_async_tracking": bool(getattr(args, "realsense_async_tracking", False)),
             "rgb_image_dir": str(args.rgb_image_dir),
             "intrinsic_camera_index": int(args.intrinsic_camera_index),
             "image_size": int(args.image_size),
@@ -1376,6 +2336,8 @@ def _write_live_json(
                 getattr(args, "lingbot_pose_translation_scale", 0.0) or getattr(args, "depth_scale", 1.0)
             ),
             "lingbot_extrinsic_mode": str(getattr(args, "lingbot_extrinsic_mode", "inverse")),
+            "lingbot_enable_camera": bool(getattr(args, "lingbot_enable_camera", False)),
+            "prefer_lingbot_pose": bool(getattr(args, "prefer_lingbot_pose", False)),
             "sample_stride": int(args.sample_stride),
             "sampling_pattern": str(getattr(args, "sampling_pattern", "grid")),
             "max_points_per_frame": int(args.max_points_per_frame),
@@ -1407,6 +2369,312 @@ def _write_live_json(
     return payload
 
 
+def _clone_point_batch(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {
+        key: (np.asarray(value).copy() if isinstance(value, np.ndarray) else value)
+        for key, value in batch.items()
+    }
+
+
+def _clone_frame_points(
+    frame_points: OrderedDict[int, dict[str, np.ndarray]],
+) -> OrderedDict[int, dict[str, np.ndarray]]:
+    return OrderedDict((int(key), _clone_point_batch(value)) for key, value in frame_points.items())
+
+
+class BackgroundArtifactWriter:
+    """Latest-only background writer for non-live-critical JSON/PLY artifacts."""
+
+    def __init__(self, *, max_jobs: int = 4) -> None:
+        self.max_jobs = max(1, int(max_jobs))
+        self._pending: dict[str, tuple[Callable[[], None], float]] = {}
+        self._order: deque[str] = deque()
+        self._condition = threading.Condition()
+        self._stop = False
+        self.submitted_jobs = 0
+        self.completed_jobs = 0
+        self.replaced_jobs = 0
+        self.dropped_jobs = 0
+        self.last_error: str | None = None
+        self._thread = threading.Thread(target=self._run, name="artifact-writer", daemon=True)
+        self._thread.start()
+
+    def submit(self, key: str, fn: Callable[[], None]) -> float:
+        started = time.perf_counter()
+        with self._condition:
+            if key in self._pending:
+                self.replaced_jobs += 1
+            else:
+                while len(self._pending) >= self.max_jobs and self._order:
+                    old_key = self._order.popleft()
+                    if old_key in self._pending:
+                        self._pending.pop(old_key, None)
+                        self.dropped_jobs += 1
+                        break
+                self._order.append(key)
+            self._pending[key] = (fn, time.perf_counter())
+            self.submitted_jobs += 1
+            self._condition.notify()
+        return time.perf_counter() - started
+
+    def submit_ply(
+        self,
+        key: str,
+        path: Path,
+        xyz: np.ndarray,
+        rgb: np.ndarray,
+        semantic_label: np.ndarray | None = None,
+        semantic_conf: np.ndarray | None = None,
+        observations: np.ndarray | None = None,
+    ) -> float:
+        xyz_copy = np.asarray(xyz, dtype=np.float32).copy()
+        rgb_copy = np.asarray(rgb, dtype=np.uint8).copy()
+        label_copy = None if semantic_label is None else np.asarray(semantic_label, dtype=np.int32).copy()
+        conf_copy = None if semantic_conf is None else np.asarray(semantic_conf, dtype=np.float32).copy()
+        obs_copy = None if observations is None else np.asarray(observations, dtype=np.int32).copy()
+        return self.submit(
+            key,
+            lambda: _write_ascii_ply(path, xyz_copy, rgb_copy, label_copy, conf_copy, obs_copy),
+        )
+
+    def submit_live_snapshot(
+        self,
+        output_dir: Path,
+        frame_points: OrderedDict[int, dict[str, np.ndarray]],
+        trajectory: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        args: argparse.Namespace,
+    ) -> float:
+        frame_points_copy = _clone_frame_points(frame_points)
+        trajectory_copy = list(trajectory)
+        events_copy = list(events)
+        return self.submit(
+            "live_snapshot",
+            lambda: _write_live_json(output_dir, frame_points_copy, trajectory_copy, events_copy, args),
+        )
+
+    def status(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "pending_jobs": len(self._pending),
+                "submitted_jobs": int(self.submitted_jobs),
+                "completed_jobs": int(self.completed_jobs),
+                "replaced_jobs": int(self.replaced_jobs),
+                "dropped_jobs": int(self.dropped_jobs),
+                "last_error": self.last_error,
+            }
+
+    def close(self, *, drain: bool = True, timeout_sec: float = 8.0) -> None:
+        deadline = time.perf_counter() + max(0.0, timeout_sec)
+        if drain:
+            while time.perf_counter() < deadline:
+                with self._condition:
+                    if not self._pending:
+                        break
+                time.sleep(0.02)
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        remaining = max(0.1, deadline - time.perf_counter())
+        self._thread.join(timeout=remaining)
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._stop and not self._order:
+                    self._condition.wait()
+                if self._stop and not self._order:
+                    return
+                key = self._order.popleft()
+                item = self._pending.pop(key, None)
+                if item is None:
+                    continue
+            fn, _queued_at = item
+            try:
+                fn()
+                self.completed_jobs += 1
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+
+
+class BinaryPointCloudWebSocketServer:
+    """Tiny binary WebSocket server for latest colored point clouds."""
+
+    MAGIC = b"LBPC1"
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, *, host: str, port: int, max_points: int, frame_id: str = "map") -> None:
+        self.host = str(host)
+        self.port = int(port)
+        self.max_points = int(max_points)
+        self.frame_id = str(frame_id)
+        self._clients: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.published_messages = 0
+        self.connected_clients = 0
+        self.last_error: str | None = None
+        self._server: socket.socket | None = None
+        self._thread = threading.Thread(target=self._serve, name="binary-cloud-ws", daemon=True)
+        self._thread.start()
+
+    def publish_cloud(self, xyz: np.ndarray, rgb: np.ndarray, *, stamp_ms: int | None = None) -> float:
+        started = time.perf_counter()
+        xyz_arr = np.asarray(xyz, dtype=np.float32)
+        rgb_arr = np.asarray(rgb, dtype=np.uint8)
+        if xyz_arr.ndim != 2 or xyz_arr.shape[1] != 3 or xyz_arr.shape[0] == 0:
+            return 0.0
+        if rgb_arr.ndim != 2 or rgb_arr.shape[1] != 3 or rgb_arr.shape[0] != xyz_arr.shape[0]:
+            rgb_arr = np.full((xyz_arr.shape[0], 3), 255, dtype=np.uint8)
+        source_count = int(xyz_arr.shape[0])
+        if self.max_points > 0 and source_count > self.max_points:
+            idx = np.linspace(0, source_count - 1, int(self.max_points)).astype(np.int64)
+            xyz_arr = xyz_arr[idx]
+            rgb_arr = rgb_arr[idx]
+        xyz_bytes = np.ascontiguousarray(xyz_arr.astype("<f4", copy=False)).tobytes()
+        rgb_bytes = np.ascontiguousarray(rgb_arr.astype(np.uint8, copy=False)).tobytes()
+        header = {
+            "schema": "lingbot.binary_point_cloud.v1",
+            "frameId": self.frame_id,
+            "stampMs": int(stamp_ms if stamp_ms is not None else time.time() * 1000),
+            "sourcePointCount": source_count,
+            "renderedPointCount": int(xyz_arr.shape[0]),
+            "xyzBytes": len(xyz_bytes),
+            "rgbBytes": len(rgb_bytes),
+        }
+        header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        payload = self.MAGIC + struct.pack("<I", len(header_bytes)) + header_bytes + xyz_bytes + rgb_bytes
+        frame = self._websocket_binary_frame(payload)
+        stale: list[socket.socket] = []
+        with self._lock:
+            clients = list(self._clients)
+        for client in clients:
+            try:
+                client.sendall(frame)
+            except OSError:
+                stale.append(client)
+        if stale:
+            with self._lock:
+                for client in stale:
+                    if client in self._clients:
+                        self._clients.remove(client)
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                self.connected_clients = len(self._clients)
+        self.published_messages += 1
+        return time.perf_counter() - started
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            clients = len(self._clients)
+        return {
+            "host": self.host,
+            "port": self.port,
+            "connected_clients": clients,
+            "published_messages": int(self.published_messages),
+            "last_error": self.last_error,
+        }
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._server is not None:
+            try:
+                self._server.close()
+            except OSError:
+                pass
+        with self._lock:
+            clients = list(self._clients)
+            self._clients.clear()
+            self.connected_clients = 0
+        for client in clients:
+            try:
+                client.close()
+            except OSError:
+                pass
+        self._thread.join(timeout=1.0)
+
+    def _serve(self) -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server = server
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.host, self.port))
+            server.listen(8)
+            server.settimeout(0.5)
+            while not self._stop.is_set():
+                try:
+                    client, _addr = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                server.close()
+            except OSError:
+                pass
+
+    def _handle_client(self, client: socket.socket) -> None:
+        try:
+            client.settimeout(2.0)
+            request = b""
+            while b"\r\n\r\n" not in request and len(request) < 8192:
+                chunk = client.recv(1024)
+                if not chunk:
+                    client.close()
+                    return
+                request += chunk
+            headers = self._parse_http_headers(request.decode("latin1", errors="ignore"))
+            key = headers.get("sec-websocket-key")
+            if not key:
+                client.close()
+                return
+            accept = base64.b64encode(hashlib.sha1((key + self.GUID).encode("ascii")).digest()).decode("ascii")
+            response = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n"
+                "\r\n"
+            )
+            client.sendall(response.encode("ascii"))
+            client.settimeout(None)
+            with self._lock:
+                self._clients.append(client)
+                self.connected_clients = len(self._clients)
+        except OSError:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _parse_http_headers(raw: str) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for line in raw.split("\r\n")[1:]:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+        return headers
+
+    @staticmethod
+    def _websocket_binary_frame(payload: bytes) -> bytes:
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB", 0x82, length)
+        elif length <= 0xFFFF:
+            header = struct.pack("!BBH", 0x82, 126, length)
+        else:
+            header = struct.pack("!BBQ", 0x82, 127, length)
+        return header + payload
+
+
 def _stats(values: list[float]) -> dict[str, float]:
     finite = [float(value) for value in values if math.isfinite(float(value))]
     if not finite:
@@ -1420,6 +2688,47 @@ def _stats(values: list[float]) -> dict[str, float]:
         "max": float(ordered[-1]),
         "p90": float(ordered[min(len(ordered) - 1, int(math.ceil(0.90 * len(ordered))) - 1)]),
     }
+
+
+def _memory_status() -> dict[str, float]:
+    values: dict[str, float] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                values[parts[0].rstrip(":")] = float(parts[1]) / (1024.0 * 1024.0)
+    except Exception:
+        return {}
+    total = values.get("MemTotal", 0.0)
+    available = values.get("MemAvailable", 0.0)
+    swap_total = values.get("SwapTotal", 0.0)
+    swap_free = values.get("SwapFree", 0.0)
+    return {
+        "mem_total_gb": total,
+        "mem_available_gb": available,
+        "mem_used_gb": max(0.0, total - available),
+        "swap_total_gb": swap_total,
+        "swap_used_gb": max(0.0, swap_total - swap_free),
+    }
+
+
+def _rotation_delta_deg(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    if left.shape != (4, 4) or right.shape != (4, 4):
+        return 0.0
+    rel = left[:3, :3].T @ right[:3, :3]
+    trace = float(np.trace(rel))
+    cos_angle = max(-1.0, min(1.0, (trace - 1.0) * 0.5))
+    return float(math.degrees(math.acos(cos_angle)))
+
+
+def _translation_delta_m(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    if left.shape != (4, 4) or right.shape != (4, 4):
+        return 0.0
+    return float(np.linalg.norm(right[:3, 3] - left[:3, 3]))
 
 
 def _write_viewer_html(output_dir: Path) -> None:
@@ -1548,13 +2857,23 @@ def _process_worker_result(
     args: argparse.Namespace,
     semantic_projector: YOLOSemanticProjector | None = None,
     fusion_map: VoxelFusionMap | None = None,
+    rolling_map: RollingPointCloudMap | None = None,
+    global_map: PersistentPointCloudMap | None = None,
+    artifact_writer: BackgroundArtifactWriter | None = None,
+    source_elapsed_sec: float | None = None,
 ) -> dict[str, Any]:
-    result = json.loads(result_path.read_text(encoding="utf-8"))
     process_started = time.perf_counter()
+    result_load_started = time.perf_counter()
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result_json_load_sec = time.perf_counter() - result_load_started
     pred_path = Path(result["predictions_npz"])
     summary_path = Path(result["summary_json"])
+    summary_load_started = time.perf_counter()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary_json_load_sec = time.perf_counter() - summary_load_started
+    pred_load_started = time.perf_counter()
     pred = np.load(pred_path)
+    predictions_npz_load_sec = time.perf_counter() - pred_load_started
     depth = _squeeze_depth(pred["depth"])
     conf = _squeeze_depth(pred["depth_conf"]) if "depth_conf" in pred else np.ones_like(depth, dtype=np.float32)
     lingbot_extrinsic = np.asarray(pred["extrinsic"], dtype=np.float32) if "extrinsic" in pred else None
@@ -1563,25 +2882,43 @@ def _process_worker_result(
         getattr(args, "lingbot_pose_translation_scale", 0.0) or getattr(args, "depth_scale", 1.0)
     )
     frames = summary.get("metadata", {}).get("frames", [])
+    timestamps_sec = [float(value) for value in summary.get("metadata", {}).get("timestamps_sec", []) if value is not None]
+    latest_frame_timestamp_sec = max(timestamps_sec) if timestamps_sec else None
     updated = 0
     total_points = 0
+    pointcloud_build_sec = 0.0
     current_batches: list[dict[str, np.ndarray]] = []
+    local_batches: list[dict[str, np.ndarray]] = []
+    pose_source_counts: dict[str, int] = {}
+    prefer_lingbot_pose = bool(getattr(args, "prefer_lingbot_pose", False))
     for local_idx, frame in enumerate(frames[: depth.shape[0]]):
         meta = frame.get("metadata") or {}
         frame_idx = int(frame.get("frame_idx", local_idx))
         pose = None
-        if "pose" in meta:
+        pose_source = ""
+        if prefer_lingbot_pose and lingbot_extrinsic is not None and local_idx < lingbot_extrinsic.shape[0]:
+            pose = _lingbot_extrinsic_to_pose(
+                lingbot_extrinsic[local_idx],
+                translation_scale=lingbot_translation_scale,
+                mode=getattr(args, "lingbot_extrinsic_mode", "inverse"),
+            )
+            pose_source = "lingbot"
+        elif "pose" in meta:
             pose = np.asarray(meta["pose"], dtype=np.float32)
+            pose_source = "metadata"
         elif frame_idx in trajectory_by_frame and "pose" in trajectory_by_frame[frame_idx]:
             pose = np.asarray(trajectory_by_frame[frame_idx]["pose"], dtype=np.float32)
+            pose_source = "trajectory"
         elif lingbot_extrinsic is not None and local_idx < lingbot_extrinsic.shape[0]:
             pose = _lingbot_extrinsic_to_pose(
                 lingbot_extrinsic[local_idx],
                 translation_scale=lingbot_translation_scale,
                 mode=getattr(args, "lingbot_extrinsic_mode", "inverse"),
             )
+            pose_source = "lingbot_fallback"
         if pose is None:
             continue
+        pose_source_counts[pose_source or "unknown"] = pose_source_counts.get(pose_source or "unknown", 0) + 1
         image_path = str(frame.get("image_path", ""))
         color_image_path = _resolve_color_image_path(args, frame_idx)
         sample_image_path = color_image_path or image_path
@@ -1596,6 +2933,7 @@ def _process_worker_result(
             K = np.asarray(lingbot_intrinsic[local_idx], dtype=np.float32)
         else:
             K = _scaled_intrinsic(K_base, (int(original_shape[0]), int(original_shape[1])), depth[local_idx].shape)
+        pointcloud_started = time.perf_counter()
         sampled = _sample_frame_points(
             depth=depth[local_idx],
             conf=conf[local_idx],
@@ -1607,6 +2945,7 @@ def _process_worker_result(
             semantic_projector=semantic_projector,
             image_path=sample_image_path,
         )
+        pointcloud_build_sec += time.perf_counter() - pointcloud_started
         if fusion_map is not None:
             fusion_map.update(sampled)
         else:
@@ -1617,21 +2956,114 @@ def _process_worker_result(
         total_points += int(sampled["xyz"].shape[0])
         if sampled["xyz"].shape[0] > 0:
             current_batches.append(sampled)
+            local_sampled = {
+                key: (value.copy() if isinstance(value, np.ndarray) else value)
+                for key, value in sampled.items()
+            }
+            local_sampled["xyz"] = ((sampled["xyz"] - pose[:3, 3]) @ pose[:3, :3]).astype(np.float32)
+            local_batches.append(local_sampled)
         updated += 1
+    dense_debug_dir = result_path.parents[2] / "dense_windows" if len(result_path.parents) > 2 else result_path.parent
+    window_index = int(result["index"])
+    artifact_submit_sec = 0.0
+    if current_batches:
+        xyz_world, rgb_world, _, label_world, conf_world, obs_world = _collect_batches_arrays(current_batches)
+        if artifact_writer is not None:
+            artifact_submit_sec += artifact_writer.submit_ply(
+                f"dense_world_{window_index:06d}",
+                dense_debug_dir / f"window_{window_index:06d}_world.ply",
+                xyz_world,
+                rgb_world,
+                label_world,
+                conf_world,
+                obs_world,
+            )
+        else:
+            _write_ascii_ply(
+                dense_debug_dir / f"window_{window_index:06d}_world.ply",
+                xyz_world,
+                rgb_world,
+                label_world,
+                conf_world,
+                obs_world,
+            )
+    if local_batches:
+        xyz_local, rgb_local, _, label_local, conf_local, obs_local = _collect_batches_arrays(local_batches)
+        if artifact_writer is not None:
+            artifact_submit_sec += artifact_writer.submit_ply(
+                f"dense_local_{window_index:06d}",
+                dense_debug_dir / f"window_{window_index:06d}_local.ply",
+                xyz_local,
+                rgb_local,
+                label_local,
+                conf_local,
+                obs_local,
+            )
+        else:
+            _write_ascii_ply(
+                dense_debug_dir / f"window_{window_index:06d}_local.ply",
+                xyz_local,
+                rgb_local,
+                label_local,
+                conf_local,
+                obs_local,
+            )
+    if rolling_map is not None and current_batches:
+        rolling_map.add_window(window_index, latest_frame_timestamp_sec, current_batches)
+    if global_map is not None and current_batches:
+        global_map.add_window(window_index, latest_frame_timestamp_sec, current_batches)
     process_elapsed = time.perf_counter() - process_started
+    lingbot_profile = summary.get("profile_sec", {}) if isinstance(summary.get("profile_sec"), dict) else {}
+    geometry_age_sec = None
+    if source_elapsed_sec is not None and latest_frame_timestamp_sec is not None:
+        geometry_age_sec = max(0.0, float(source_elapsed_sec) - float(latest_frame_timestamp_sec))
     event = {
         "type": "window",
-        "window": int(result["index"]),
+        "window": window_index,
         "updated_frames": updated,
         "points_added_or_replaced": total_points,
         "elapsed_sec": float(result["elapsed_sec"]),
+        "lingbot_elapsed_sec": float(result["elapsed_sec"]),
         "queue_wait_sec": float(result.get("queue_wait_sec", 0.0)),
         "worker_end_to_end_sec": float(result.get("end_to_end_sec", result["elapsed_sec"])),
+        "latest_frame_timestamp_sec": float(latest_frame_timestamp_sec) if latest_frame_timestamp_sec is not None else None,
+        "geometry_age_sec": float(geometry_age_sec) if geometry_age_sec is not None else None,
+        "result_json_load_sec": result_json_load_sec,
+        "summary_json_load_sec": summary_json_load_sec,
+        "predictions_npz_load_sec": predictions_npz_load_sec,
+        "pointcloud_build_sec": pointcloud_build_sec,
         "process_result_sec": process_elapsed,
+        "artifact_submit_sec": artifact_submit_sec,
+        "pose_source_counts": pose_source_counts,
     }
-    if current_batches:
+    for key in (
+        "model_load_sec",
+        "preprocess_sec",
+        "image_to_device_sec",
+        "dtype_setup_sec",
+        "model_forward_sec",
+        "postprocess_sec",
+        "tensor_to_numpy_sec",
+        "save_npz_sec",
+        "save_summary_json_sec",
+        "total_sec",
+    ):
+        if key in lingbot_profile:
+            event[key] = float(lingbot_profile[key])
+    if rolling_map is not None:
+        rolling = rolling_map.snapshot()
+        event["_current_xyz"] = rolling["xyz"]
+        event["_current_rgb"] = rolling["rgb"]
+        event["rolling_map_point_count"] = int(rolling["xyz"].shape[0])
+    elif current_batches:
         event["_current_xyz"] = np.concatenate([item["xyz"] for item in current_batches], axis=0)
         event["_current_rgb"] = np.concatenate([item["rgb"] for item in current_batches], axis=0)
+        event["rolling_map_point_count"] = int(event["_current_xyz"].shape[0])
+    if global_map is not None:
+        global_snapshot = global_map.snapshot()
+        event["_global_xyz"] = global_snapshot["xyz"]
+        event["_global_rgb"] = global_snapshot["rgb"]
+        event["global_map_point_count"] = int(global_snapshot["xyz"].shape[0])
     return event
 
 
@@ -1652,15 +3084,275 @@ def _refresh_fusion_snapshot(
     return int(snapshot["xyz"].shape[0])
 
 
+class KeyframeManager:
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        translation_thresh_m: float,
+        rotation_thresh_deg: float,
+        time_thresh_sec: float,
+        max_keyframes: int,
+    ) -> None:
+        self.output_dir = output_dir
+        self.keyframe_dir = output_dir / "keyframes"
+        self.keyframe_dir.mkdir(parents=True, exist_ok=True)
+        self.translation_thresh_m = float(translation_thresh_m)
+        self.rotation_thresh_deg = float(rotation_thresh_deg)
+        self.time_thresh_sec = float(time_thresh_sec)
+        self.max_keyframes = int(max_keyframes)
+        self.keyframes: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._last_pose: np.ndarray | None = None
+        self._last_timestamp_sec: float | None = None
+
+    def maybe_add(self, item: TrackingOutput, K: np.ndarray) -> bool:
+        pose = np.asarray(item.pose, dtype=np.float32)
+        timestamp_sec = float(item.timestamp_sec)
+        accept = self._last_pose is None
+        if not accept and self._last_pose is not None:
+            translation = _translation_delta_m(self._last_pose, pose)
+            rotation = _rotation_delta_deg(self._last_pose, pose)
+            dt = timestamp_sec - float(self._last_timestamp_sec or timestamp_sec)
+            accept = (
+                translation >= self.translation_thresh_m
+                or rotation >= self.rotation_thresh_deg
+                or dt >= self.time_thresh_sec
+                or not bool(item.track_ok)
+            )
+        if not accept:
+            return False
+        image_path = str(item.image_path or "")
+        saved_image = ""
+        if image_path:
+            src = Path(image_path)
+            if src.exists():
+                saved = self.keyframe_dir / f"{int(item.frame_idx):06d}.png"
+                if not saved.exists():
+                    try:
+                        shutil.copy2(src, saved)
+                    except Exception:
+                        pass
+                saved_image = str(saved)
+        record = {
+            "frame_idx": int(item.frame_idx),
+            "timestamp_sec": timestamp_sec,
+            "image_path": saved_image or image_path,
+            "intrinsic": np.asarray(K, dtype=np.float32).astype(float).tolist(),
+            "T_world_camera": pose.astype(float).tolist(),
+            "track_ok": bool(item.track_ok),
+        }
+        self.keyframes[int(item.frame_idx)] = record
+        self.keyframes.move_to_end(int(item.frame_idx))
+        while self.max_keyframes > 0 and len(self.keyframes) > self.max_keyframes:
+            self.keyframes.popitem(last=False)
+        self._last_pose = pose.copy()
+        self._last_timestamp_sec = timestamp_sec
+        self.write_index()
+        return True
+
+    def write_index(self) -> None:
+        path = self.keyframe_dir / "keyframes.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"keyframes": list(self.keyframes.values())}, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+
+class RollingPointCloudMap:
+    def __init__(
+        self,
+        *,
+        voxel_size: float,
+        radius_m: float,
+        min_neighbors: int,
+        max_windows: int,
+        max_age_sec: float,
+        max_points: int,
+    ) -> None:
+        self.voxel_size = max(0.0, float(voxel_size))
+        self.radius_m = max(0.0, float(radius_m))
+        self.min_neighbors = max(0, int(min_neighbors))
+        self.max_windows = int(max_windows)
+        self.max_age_sec = float(max_age_sec)
+        self.max_points = int(max_points)
+        self.windows: OrderedDict[int, dict[str, Any]] = OrderedDict()
+
+    def add_window(self, window_index: int, timestamp_sec: float | None, batches: list[dict[str, np.ndarray]]) -> None:
+        if not batches:
+            return
+        xyz = np.concatenate([np.asarray(item["xyz"], dtype=np.float32) for item in batches], axis=0)
+        rgb = np.concatenate([np.asarray(item["rgb"], dtype=np.uint8) for item in batches], axis=0)
+        frames = np.concatenate([np.asarray(item["frame"], dtype=np.int32) for item in batches], axis=0)
+        semantic_label = np.concatenate(
+            [np.asarray(item.get("semantic_label", np.full((item["xyz"].shape[0],), -1)), dtype=np.int32) for item in batches],
+            axis=0,
+        )
+        semantic_conf = np.concatenate(
+            [np.asarray(item.get("semantic_conf", np.zeros((item["xyz"].shape[0],))), dtype=np.float32) for item in batches],
+            axis=0,
+        )
+        observations = np.ones((xyz.shape[0],), dtype=np.int32)
+        batch = {
+            "xyz": xyz,
+            "rgb": rgb,
+            "frame": frames,
+            "semantic_label": semantic_label,
+            "semantic_conf": semantic_conf,
+            "observations": observations,
+            "timestamp_sec": float(timestamp_sec) if timestamp_sec is not None else None,
+        }
+        batch = self._filter_batch(batch)
+        self.windows[int(window_index)] = batch
+        self.windows.move_to_end(int(window_index))
+        self._prune(timestamp_sec)
+
+    def _filter_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        xyz = np.asarray(batch["xyz"], dtype=np.float32)
+        if xyz.shape[0] == 0:
+            return batch
+        keep = np.isfinite(xyz).all(axis=1)
+        if self.radius_m > 0.0 and self.min_neighbors > 0 and xyz.shape[0] > self.min_neighbors:
+            q = np.floor(xyz / self.radius_m).astype(np.int32)
+            keys, inverse, counts = np.unique(q, axis=0, return_inverse=True, return_counts=True)
+            neighbor_counts = counts[inverse]
+            keep &= neighbor_counts >= self.min_neighbors
+        for key in ("xyz", "rgb", "frame", "semantic_label", "semantic_conf", "observations"):
+            batch[key] = np.asarray(batch[key])[keep]
+        return self._voxel_downsample(batch)
+
+    def _voxel_downsample(self, batch: dict[str, Any]) -> dict[str, Any]:
+        xyz = np.asarray(batch["xyz"], dtype=np.float32)
+        if self.voxel_size <= 0.0 or xyz.shape[0] == 0:
+            return batch
+        q = np.floor(xyz / self.voxel_size).astype(np.int32)
+        _, unique_idx = np.unique(q, axis=0, return_index=True)
+        if self.max_points > 0 and unique_idx.size > self.max_points:
+            unique_idx = unique_idx[np.linspace(0, unique_idx.size - 1, self.max_points).astype(np.int64)]
+        for key in ("xyz", "rgb", "frame", "semantic_label", "semantic_conf", "observations"):
+            batch[key] = np.asarray(batch[key])[unique_idx]
+        return batch
+
+    def _prune(self, latest_timestamp_sec: float | None) -> None:
+        while self.max_windows > 0 and len(self.windows) > self.max_windows:
+            self.windows.popitem(last=False)
+        if self.max_age_sec > 0.0 and latest_timestamp_sec is not None:
+            cutoff = float(latest_timestamp_sec) - self.max_age_sec
+            for key in list(self.windows.keys()):
+                ts = self.windows[key].get("timestamp_sec")
+                if ts is not None and float(ts) < cutoff:
+                    self.windows.pop(key, None)
+
+    def snapshot(self) -> dict[str, np.ndarray]:
+        if not self.windows:
+            return empty_point_batch()
+        keys = ("xyz", "rgb", "frame", "semantic_label", "semantic_conf", "observations")
+        out = {key: np.concatenate([np.asarray(item[key]) for item in self.windows.values()], axis=0) for key in keys}
+        if self.max_points > 0 and out["xyz"].shape[0] > self.max_points:
+            idx = np.linspace(0, out["xyz"].shape[0] - 1, self.max_points).astype(np.int64)
+            out = {key: value[idx] for key, value in out.items()}
+        return out
+
+    def point_count(self) -> int:
+        return int(sum(np.asarray(item["xyz"]).shape[0] for item in self.windows.values()))
+
+
+class PersistentPointCloudMap(RollingPointCloudMap):
+    """Voxel-bounded global map that keeps old geometry instead of pruning by time/window."""
+
+    def __init__(
+        self,
+        *,
+        voxel_size: float,
+        radius_m: float,
+        min_neighbors: int,
+        max_points: int,
+    ) -> None:
+        super().__init__(
+            voxel_size=voxel_size,
+            radius_m=radius_m,
+            min_neighbors=min_neighbors,
+            max_windows=0,
+            max_age_sec=0.0,
+            max_points=max_points,
+        )
+        self._map = empty_point_batch()
+
+    def add_window(self, window_index: int, timestamp_sec: float | None, batches: list[dict[str, np.ndarray]]) -> None:
+        if not batches:
+            return
+        xyz = np.concatenate([np.asarray(item["xyz"], dtype=np.float32) for item in batches], axis=0)
+        rgb = np.concatenate([np.asarray(item["rgb"], dtype=np.uint8) for item in batches], axis=0)
+        frames = np.concatenate([np.asarray(item["frame"], dtype=np.int32) for item in batches], axis=0)
+        semantic_label = np.concatenate(
+            [np.asarray(item.get("semantic_label", np.full((item["xyz"].shape[0],), -1)), dtype=np.int32) for item in batches],
+            axis=0,
+        )
+        semantic_conf = np.concatenate(
+            [np.asarray(item.get("semantic_conf", np.zeros((item["xyz"].shape[0],))), dtype=np.float32) for item in batches],
+            axis=0,
+        )
+        observations = np.ones((xyz.shape[0],), dtype=np.int32)
+        batch = self._filter_batch(
+            {
+                "xyz": xyz,
+                "rgb": rgb,
+                "frame": frames,
+                "semantic_label": semantic_label,
+                "semantic_conf": semantic_conf,
+                "observations": observations,
+            }
+        )
+        if self._map["xyz"].shape[0] > 0:
+            merged = {
+                key: np.concatenate([np.asarray(self._map[key]), np.asarray(batch[key])], axis=0)
+                for key in ("xyz", "rgb", "frame", "semantic_label", "semantic_conf", "observations")
+            }
+        else:
+            merged = {key: np.asarray(batch[key]) for key in ("xyz", "rgb", "frame", "semantic_label", "semantic_conf", "observations")}
+        self._map = self._voxel_downsample(merged)
+
+    def snapshot(self) -> dict[str, np.ndarray]:
+        return {key: np.asarray(value) for key, value in self._map.items()}
+
+    def point_count(self) -> int:
+        return int(np.asarray(self._map["xyz"]).shape[0])
+
+
 def main() -> int:
     args = parse_args()
     if args.drop_when_busy:
         args.no_blocking_submit = True
+    if args.pause_tracking_while_dense and args.dense_busy_tracking_policy == "none":
+        args.dense_busy_tracking_policy = "pause"
+    if args.hikrobot_async_tracking and args.dense_busy_tracking_policy == "pause":
+        args.dense_busy_tracking_policy = "none"
     root = REPO_ROOT.parents[1] if False else Path.cwd()
     sequence_dir = Path(args.sequence_dir).expanduser().resolve()
     trajectory_path = Path(args.trajectory_path).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.clean_output:
+        shutil.rmtree(output_dir / "worker", ignore_errors=True)
+        shutil.rmtree(output_dir / "dense_windows", ignore_errors=True)
+        shutil.rmtree(output_dir / "keyframes", ignore_errors=True)
+        shutil.rmtree(output_dir / "rgb_preview", ignore_errors=True)
+        for name in (
+            "live_map.json",
+            "live_map.json.tmp",
+            "live_map.npz",
+            "live_map.npz.tmp",
+            "live_map.ply",
+            "rolling_map.ply",
+            "global_map.ply",
+            "trajectory.txt",
+            "run.log",
+            "run_summary.json",
+            "full_stack_metrics.json",
+            "metrics.json",
+        ):
+            try:
+                (output_dir / name).unlink()
+            except FileNotFoundError:
+                pass
     if args.lingbot_map_root:
         os.environ["LINGBOT_MAP_ROOT"] = str(Path(args.lingbot_map_root).expanduser().resolve())
 
@@ -1685,6 +3377,8 @@ def main() -> int:
             image_max_width=args.ros2_image_max_width,
             image_max_height=args.ros2_image_max_height,
             republish_current_cloud_on_image=args.ros2_republish_current_cloud_on_image,
+            current_cloud_republish_interval_sec=args.ros2_current_cloud_republish_interval_sec,
+            rgb_preview_dir=(output_dir / "rgb_preview") if args.serve else None,
             path_max_poses=args.ros2_path_max_poses,
         )
     fusion_map = (
@@ -1695,6 +3389,35 @@ def main() -> int:
         )
         if args.fusion_mode == "voxel"
         else None
+    )
+    rolling_map = (
+        RollingPointCloudMap(
+            voxel_size=args.rolling_map_voxel_size,
+            radius_m=args.rolling_map_radius_m,
+            min_neighbors=args.rolling_map_min_neighbors,
+            max_windows=args.rolling_map_max_windows,
+            max_age_sec=args.rolling_map_max_age_sec,
+            max_points=args.rolling_map_max_points,
+        )
+        if args.rolling_map
+        else None
+    )
+    global_map = (
+        PersistentPointCloudMap(
+            voxel_size=args.global_map_voxel_size,
+            radius_m=args.global_map_radius_m,
+            min_neighbors=args.global_map_min_neighbors,
+            max_points=args.global_map_max_points,
+        )
+        if args.global_map
+        else None
+    )
+    keyframe_manager = KeyframeManager(
+        output_dir,
+        translation_thresh_m=args.keyframe_translation_thresh_m,
+        rotation_thresh_deg=args.keyframe_rotation_thresh_deg,
+        time_thresh_sec=args.keyframe_time_thresh_sec,
+        max_keyframes=args.keyframe_max_count,
     )
     if args.tracking_backend == "hikrobot_mono_rgb":
         rgb_output_dir = args.rgb_output_dir or str(output_dir / "rgb_stream")
@@ -1711,13 +3434,81 @@ def main() -> int:
             read_error_sleep_sec=args.hikrobot_read_error_sleep_sec,
             threaded_capture=args.hikrobot_threaded_capture,
             capture_queue_size=args.hikrobot_capture_queue_size,
+            async_tracking=args.hikrobot_async_tracking,
+            tracking_queue_size=args.hikrobot_tracking_queue_size,
+            tracking_idle_fps=args.hikrobot_tracking_idle_fps,
+            tracking_dense_fps=args.hikrobot_tracking_dense_fps,
             intrinsic_args=(args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy),
             config=config.tracking,
+            distortion_coeffs=args.camera_distortion_coeffs,
+            undistort_camera=args.camera_undistort,
             fixed_step_scale=args.mono_fixed_step_scale,
             frame_step=args.frame_step,
             max_frames=args.max_frames,
             frame_callback=ros_bridge.publish_image if ros_bridge is not None else None,
+            disable_cuvslam=args.hikrobot_disable_cuvslam,
         )
+        K_base = source.K.astype(np.float32)
+        sequence_dir = Path(rgb_output_dir).expanduser().resolve()
+        if not args.color_image_dir:
+            args.color_image_dir = str(sequence_dir)
+        if not args.rgb_image_dir:
+            args.rgb_image_dir = str(sequence_dir)
+        args.color_image_template = "{frame_idx:06d}.png"
+    elif args.tracking_backend == "realsense_mono_rgb":
+        rgb_output_dir = args.rgb_output_dir or str(output_dir / "rgb_stream")
+        if args.realsense_input_mode == "ros2":
+            source = ROS2MonocularRGBAdapter(
+                output_dir=rgb_output_dir,
+                image_topic=args.realsense_image_topic,
+                camera_info_topic=args.realsense_camera_info_topic,
+                timeout_ms=args.realsense_timeout_ms,
+                max_read_errors=args.realsense_max_read_errors,
+                read_error_sleep_sec=args.realsense_read_error_sleep_sec,
+                capture_queue_size=args.realsense_capture_queue_size,
+                async_tracking=args.realsense_async_tracking,
+                tracking_queue_size=args.realsense_tracking_queue_size,
+                tracking_idle_fps=args.realsense_tracking_idle_fps,
+                tracking_dense_fps=args.realsense_tracking_dense_fps,
+                intrinsic_args=(args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy),
+                config=config.tracking,
+                distortion_coeffs=args.camera_distortion_coeffs,
+                undistort_camera=args.camera_undistort,
+                fixed_step_scale=args.mono_fixed_step_scale,
+                frame_step=args.frame_step,
+                max_frames=args.max_frames,
+                frame_callback=None,
+                disable_cuvslam=args.realsense_disable_cuvslam,
+                source_name="realsense_mono_rgb",
+                log_name="RealSense ROS2",
+            )
+        else:
+            source = RealSenseMonocularRGBAdapter(
+                output_dir=rgb_output_dir,
+                camera_index=args.realsense_index,
+                serial=args.realsense_serial,
+                timeout_ms=args.realsense_timeout_ms,
+                fps=args.realsense_fps,
+                capture_width=args.realsense_width,
+                capture_height=args.realsense_height,
+                max_read_errors=args.realsense_max_read_errors,
+                read_error_sleep_sec=args.realsense_read_error_sleep_sec,
+                threaded_capture=args.realsense_threaded_capture,
+                capture_queue_size=args.realsense_capture_queue_size,
+                async_tracking=args.realsense_async_tracking,
+                tracking_queue_size=args.realsense_tracking_queue_size,
+                tracking_idle_fps=args.realsense_tracking_idle_fps,
+                tracking_dense_fps=args.realsense_tracking_dense_fps,
+                intrinsic_args=(args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy),
+                config=config.tracking,
+                distortion_coeffs=args.camera_distortion_coeffs,
+                undistort_camera=args.camera_undistort,
+                fixed_step_scale=args.mono_fixed_step_scale,
+                frame_step=args.frame_step,
+                max_frames=args.max_frames,
+                frame_callback=ros_bridge.publish_image if ros_bridge is not None else None,
+                disable_cuvslam=args.realsense_disable_cuvslam,
+            )
         K_base = source.K.astype(np.float32)
         sequence_dir = Path(rgb_output_dir).expanduser().resolve()
         if not args.color_image_dir:
@@ -1756,7 +3547,7 @@ def main() -> int:
                 oxts_dir=args.oxts_dir,
             )
     else:
-        if args.tracking_backend != "hikrobot_mono_rgb":
+        if args.tracking_backend not in {"hikrobot_mono_rgb", "realsense_mono_rgb"}:
             source = CUVSLAMOfflineKITTIAdapter(
                 sequence_path=sequence_dir,
                 trajectory_path=trajectory_path,
@@ -1775,8 +3566,9 @@ def main() -> int:
             num_scale_frames=args.num_scale_frames,
             max_queue=args.max_queue,
             force_cpu=False,
-            offload_to_cpu=True,
+            offload_to_cpu=args.offload_to_cpu,
             use_sdpa=args.use_sdpa,
+            enable_camera=args.lingbot_enable_camera,
             enable_3d_rope=False,
             depth_head_trt_engine=args.depth_head_trt_engine,
             model_patch_embed=args.model_patch_embed,
@@ -1784,9 +3576,19 @@ def main() -> int:
             model_depth=args.model_depth,
             model_num_heads=args.model_num_heads,
             model_mlp_ratio=args.model_mlp_ratio,
+            compile_model=args.compile_lingbot_model,
+            compile_warmup_passes=args.compile_warmup_passes,
+            compile_warmup_stream_frames=args.compile_warmup_stream_frames,
+            persistent_streaming=args.persistent_lingbot_streaming,
             compress_outputs=not args.no_compress_output,
+            preload_model=args.preload_lingbot_model,
+            warmup_first_window=args.warmup_first_window,
         )
     )
+    if hasattr(source, "set_dense_busy_callback"):
+        source.set_dense_busy_callback(
+            lambda: str(worker.status().get("dense_state", "IDLE")) == "MODEL_FORWARD_ACTIVE"
+        )
     frame_points: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
     trajectory: list[dict[str, Any]] = []
     trajectory_by_frame: dict[int, dict[str, Any]] = {}
@@ -1799,7 +3601,19 @@ def main() -> int:
         "worker_elapsed_sec": [],
         "worker_queue_wait_sec": [],
         "worker_end_to_end_sec": [],
+        "geometry_age_sec": [],
+        "model_forward_sec": [],
+        "preprocess_sec": [],
+        "postprocess_sec": [],
+        "pointcloud_build_sec": [],
+        "predictions_npz_load_sec": [],
+        "ros_current_publish_sec": [],
+        "binary_cloud_publish_sec": [],
+        "global_binary_cloud_publish_sec": [],
+        "artifact_submit_sec": [],
         "points_added_or_replaced": [],
+        "rolling_map_point_count": [],
+        "global_map_point_count": [],
         "tracking": [],
         "windows": [],
         "dense_submit": [],
@@ -1811,26 +3625,93 @@ def main() -> int:
         args.port = port
         server = _start_http_server(output_dir, port)
         events.append({"type": "server", "url": f"http://0.0.0.0:{port}/live_viewer.html"})
+    artifact_writer = (
+        BackgroundArtifactWriter(max_jobs=args.artifact_writer_max_jobs)
+        if bool(getattr(args, "async_artifact_writer", True))
+        else None
+    )
+    binary_cloud_ws = (
+        BinaryPointCloudWebSocketServer(
+            host=args.binary_cloud_ws_host,
+            port=args.binary_cloud_ws_port,
+            max_points=args.binary_cloud_max_points,
+            frame_id=args.ros2_cloud_frame_id,
+        )
+        if int(getattr(args, "binary_cloud_ws_port", 0)) > 0
+        else None
+    )
+    if binary_cloud_ws is not None:
+        events.append({"type": "binary_cloud_ws", "url": f"ws://0.0.0.0:{args.binary_cloud_ws_port}/cloud"})
+    global_binary_cloud_ws = (
+        BinaryPointCloudWebSocketServer(
+            host=args.binary_cloud_ws_host,
+            port=args.global_binary_cloud_ws_port,
+            max_points=args.global_binary_cloud_max_points,
+            frame_id=args.ros2_cloud_frame_id,
+        )
+        if int(getattr(args, "global_binary_cloud_ws_port", 0)) > 0
+        else None
+    )
+    if global_binary_cloud_ws is not None:
+        events.append(
+            {
+                "type": "global_binary_cloud_ws",
+                "url": f"ws://0.0.0.0:{args.global_binary_cloud_ws_port}/cloud",
+            }
+        )
     if args.yolo_model and not semantic_projector.enabled:
         events.append({"type": "warning", "message": semantic_projector.error or "YOLO disabled"})
         print(semantic_projector.error or "YOLO disabled", flush=True)
 
     _write_live_json(output_dir, frame_points, trajectory, events, args)
+    run_log_path = output_dir / "run.log"
+    run_log_path.write_text("", encoding="utf-8")
     worker.start()
+    if args.preload_lingbot_model and int(args.max_frames) > 0:
+        preload_wait_started = time.perf_counter()
+        while bool(worker.status().get("preloading_model", False)):
+            time.sleep(max(0.05, float(args.poll_sec)))
+        preload_wait_sec = time.perf_counter() - preload_wait_started
+        with run_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "preload_wait": {
+                            "elapsed_sec": preload_wait_sec,
+                            "worker_status": worker.status(),
+                            "memory": _memory_status(),
+                        }
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+                + "\n"
+            )
+        print(json.dumps({"preload_wait_sec": preload_wait_sec}, ensure_ascii=False), flush=True)
     start = time.perf_counter()
+    source_start_monotonic = getattr(source, "_start", None)
     last_cloud_publish_sec = 0.0
+    geometry_update_times: deque[float] = deque(maxlen=16)
 
-    def publish_ros_cloud() -> None:
+    def current_source_elapsed_sec() -> float | None:
+        if isinstance(source_start_monotonic, (int, float)):
+            return max(0.0, time.perf_counter() - float(source_start_monotonic))
+        return None
+
+    def publish_ros_cloud() -> float:
         nonlocal last_cloud_publish_sec
         if ros_bridge is None:
-            return
+            return 0.0
         now = time.perf_counter()
         min_interval = max(0.0, float(getattr(args, "ros2_cloud_min_interval_sec", 0.0)))
         if min_interval > 0.0 and now - last_cloud_publish_sec < min_interval:
-            return
+            return 0.0
         xyz, rgb, *_ = _collect_live_arrays(frame_points)
+        publish_started = time.perf_counter()
         ros_bridge.publish_cloud(xyz, rgb)
+        elapsed = time.perf_counter() - publish_started
         last_cloud_publish_sec = time.perf_counter()
+        return elapsed
 
     def process_new_results() -> None:
         for result_path in sorted((output_dir / "worker").glob("window_*/worker_result.json")):
@@ -1845,14 +3726,43 @@ def main() -> int:
                     args,
                     semantic_projector=semantic_projector,
                     fusion_map=fusion_map,
+                    rolling_map=rolling_map,
+                    global_map=global_map,
+                    artifact_writer=artifact_writer,
+                    source_elapsed_sec=current_source_elapsed_sec(),
                 )
             except JSONDecodeError:
                 continue
             processed_results.add(result_path)
             current_xyz = event.pop("_current_xyz", None)
             current_rgb = event.pop("_current_rgb", None)
+            global_xyz = event.pop("_global_xyz", None)
+            global_rgb = event.pop("_global_rgb", None)
+            ros_current_publish_sec = 0.0
             if ros_bridge is not None and current_xyz is not None and current_rgb is not None:
+                ros_current_started = time.perf_counter()
                 ros_bridge.publish_current_cloud(current_xyz, current_rgb)
+                ros_current_publish_sec = time.perf_counter() - ros_current_started
+            event["ros_current_publish_sec"] = ros_current_publish_sec
+            binary_cloud_publish_sec = 0.0
+            if binary_cloud_ws is not None and current_xyz is not None and current_rgb is not None:
+                binary_cloud_publish_sec = binary_cloud_ws.publish_cloud(current_xyz, current_rgb)
+            event["binary_cloud_publish_sec"] = binary_cloud_publish_sec
+            global_binary_cloud_publish_sec = 0.0
+            if global_binary_cloud_ws is not None and global_xyz is not None and global_rgb is not None:
+                global_binary_cloud_publish_sec = global_binary_cloud_ws.publish_cloud(global_xyz, global_rgb)
+            event["global_binary_cloud_publish_sec"] = global_binary_cloud_publish_sec
+            now_geometry = time.perf_counter()
+            geometry_update_times.append(now_geometry)
+            if len(geometry_update_times) >= 2:
+                span = max(1e-6, geometry_update_times[-1] - geometry_update_times[0])
+                event["new_geometry_fps"] = float((len(geometry_update_times) - 1) / span)
+            else:
+                event["new_geometry_fps"] = 0.0
+            worker_status_now = worker.status()
+            event["dense_queue_size"] = int(worker_status_now.get("queue_size", 0))
+            event["dropped_window_count"] = int(worker_status_now.get("pending_window_drops", worker_status_now.get("queue_full_drops", 0)))
+            event["processed_window_count"] = int(worker_status_now.get("completed_windows", 0))
             events.append(event)
             should_publish = (
                 args.publish_every_windows > 0
@@ -1861,22 +3771,52 @@ def main() -> int:
             live_write_sec = 0.0
             point_count = int(sum(item["xyz"].shape[0] for item in frame_points.values()))
             if should_publish:
-                point_count = _refresh_fusion_snapshot(fusion_map, frame_points, int(event.get("window", 0)))
+                if rolling_map is not None:
+                    frame_points.clear()
+                    frame_points[int(event.get("window", 0))] = rolling_map.snapshot()
+                    point_count = rolling_map.point_count()
+                else:
+                    point_count = _refresh_fusion_snapshot(fusion_map, frame_points, int(event.get("window", 0)))
                 write_started = time.perf_counter()
-                payload = _write_live_json(output_dir, frame_points, trajectory, events, args)
-                publish_ros_cloud()
-                live_write_sec = time.perf_counter() - write_started
+                if artifact_writer is not None:
+                    live_write_sec = artifact_writer.submit_live_snapshot(output_dir, frame_points, trajectory, events, args)
+                    payload = {"point_count": point_count}
+                else:
+                    payload = _write_live_json(output_dir, frame_points, trajectory, events, args)
+                    live_write_sec = time.perf_counter() - write_started
+                ros_publish_sec = publish_ros_cloud()
+                event["ros_publish_sec"] = ros_publish_sec
                 point_count = int(payload["point_count"])
+            else:
+                event["ros_publish_sec"] = 0.0
             event["live_write_sec"] = live_write_sec
             event["published"] = bool(should_publish)
             metrics["process_result_sec"].append(float(event.get("process_result_sec", 0.0)))
+            metrics["binary_cloud_publish_sec"].append(float(event.get("binary_cloud_publish_sec", 0.0)))
+            metrics["global_binary_cloud_publish_sec"].append(float(event.get("global_binary_cloud_publish_sec", 0.0)))
+            metrics["artifact_submit_sec"].append(float(event.get("artifact_submit_sec", 0.0)))
             if should_publish:
                 metrics["live_write_sec"].append(live_write_sec)
             metrics["worker_elapsed_sec"].append(float(event.get("elapsed_sec", 0.0)))
             metrics["worker_queue_wait_sec"].append(float(event.get("queue_wait_sec", 0.0)))
             metrics["worker_end_to_end_sec"].append(float(event.get("worker_end_to_end_sec", event.get("elapsed_sec", 0.0))))
+            if event.get("geometry_age_sec") is not None:
+                metrics["geometry_age_sec"].append(float(event.get("geometry_age_sec", 0.0)))
+            for metric_key in (
+                "model_forward_sec",
+                "preprocess_sec",
+                "postprocess_sec",
+                "pointcloud_build_sec",
+                "predictions_npz_load_sec",
+                "ros_current_publish_sec",
+            ):
+                metrics[metric_key].append(float(event.get(metric_key, 0.0)))
             metrics["points_added_or_replaced"].append(int(event.get("points_added_or_replaced", 0)))
+            metrics["rolling_map_point_count"].append(int(event.get("rolling_map_point_count", 0)))
+            metrics["global_map_point_count"].append(int(event.get("global_map_point_count", 0)))
             metrics["windows"].append(event)
+            with run_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"live_update": event}, ensure_ascii=False, default=str) + "\n")
             print(json.dumps({"live_update": event, "point_count": point_count}, ensure_ascii=False), flush=True)
 
     submitted = 0
@@ -1884,12 +3824,41 @@ def main() -> int:
     dense_submitted_frames = 0
     dense_interval_skips = 0
     dense_non_keyframe_skips = 0
+    dense_motion_skips = 0
+    dense_worker_busy_skips = 0
+    dense_busy_tracking_throttle_waits = 0
+    dense_busy_tracking_steps = 0
     dense_window_schedules = 0
     dense_queue_full_drops_last = 0
+    last_dense_frame_idx: int | None = None
+    last_dense_pose: np.ndarray | None = None
+    last_dense_busy_tracking_sec = 0.0
     skipped = 0
     try:
         source_iter = iter(source)
         while True:
+            tracked_while_dense = False
+            tracking_policy = str(getattr(args, "dense_busy_tracking_policy", "none"))
+            if tracking_policy in {"pause", "throttle"}:
+                while True:
+                    worker_status = worker.status()
+                    worker_busy = bool(worker_status.get("worker_busy")) or int(worker_status.get("queue_size", 0)) > 0
+                    if not worker_busy:
+                        break
+                    worker_preloading = bool(worker_status.get("preloading_model", False))
+                    if tracking_policy == "throttle":
+                        now = time.perf_counter()
+                        min_interval = max(0.0, float(args.dense_busy_tracking_min_interval_sec))
+                        if not worker_preloading and now - last_dense_busy_tracking_sec >= min_interval:
+                            last_dense_busy_tracking_sec = now
+                            tracked_while_dense = True
+                            dense_busy_tracking_steps += 1
+                            break
+                        dense_busy_tracking_throttle_waits += 1
+                    else:
+                        dense_worker_busy_skips += 1
+                    process_new_results()
+                    time.sleep(max(0.02, float(args.poll_sec)))
             track_started = time.perf_counter()
             try:
                 item = next(source_iter)
@@ -1908,9 +3877,30 @@ def main() -> int:
             }
             trajectory.append(traj_item)
             trajectory_by_frame[int(item.frame_idx)] = traj_item
+            is_keyframe_selected = keyframe_manager.maybe_add(item, K_base)
             if ros_bridge is not None:
                 ros_bridge.publish_pose_path(pose, trajectory)
-            events.append({"type": "track", "frame_idx": int(item.frame_idx), "is_keyframe": bool(item.is_keyframe)})
+            events.append({
+                "type": "track",
+                "frame_idx": int(item.frame_idx),
+                "is_keyframe": bool(item.is_keyframe),
+                "keyframe_selected": bool(is_keyframe_selected),
+            })
+            with run_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "track": {
+                                "frame_idx": int(item.frame_idx),
+                                "timestamp_sec": float(item.timestamp_sec),
+                                "track_ok": bool(item.track_ok),
+                                "keyframe_selected": bool(is_keyframe_selected),
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
             if item.image_path is None:
                 continue
             should_submit_dense = True
@@ -1919,12 +3909,78 @@ def main() -> int:
                 should_submit_dense = False
                 dense_skip_reason = "non_keyframe"
                 dense_non_keyframe_skips += 1
-            dense_candidates += 1
-            if should_submit_dense and args.dense_frame_interval > 1:
-                if (dense_candidates - 1) % int(args.dense_frame_interval) != 0:
+            dense_scheduler_detail: dict[str, Any] = {}
+            worker_status_before_submit = worker.status()
+            worker_preloading = bool(worker_status_before_submit.get("preloading_model", False))
+            worker_busy_for_dense = bool(worker_status_before_submit.get("worker_busy")) or int(
+                worker_status_before_submit.get("queue_size", 0)
+            ) > 0
+            if should_submit_dense and worker_preloading:
+                should_submit_dense = False
+                dense_skip_reason = "worker_preloading"
+                dense_worker_busy_skips += 1
+            if should_submit_dense:
+                dense_candidates += 1
+            dense_seed_frames_needed = int(worker_status_before_submit.get("submitted_frames", 0)) < int(args.window_size)
+            if (
+                should_submit_dense
+                and args.dense_submit_when_worker_idle
+                and worker_busy_for_dense
+                and not dense_seed_frames_needed
+            ):
+                should_submit_dense = False
+                dense_skip_reason = "worker_busy"
+                dense_worker_busy_skips += 1
+            if should_submit_dense and dense_seed_frames_needed:
+                dense_scheduler_detail = {
+                    "dense_seed_frames_needed": True,
+                }
+            elif should_submit_dense and args.dense_scheduler == "interval":
+                if args.dense_frame_interval > 1 and (dense_candidates - 1) % int(args.dense_frame_interval) != 0:
                     should_submit_dense = False
                     dense_skip_reason = "dense_frame_interval"
                     dense_interval_skips += 1
+            elif should_submit_dense and args.dense_scheduler == "motion":
+                min_gap = max(1, int(args.dense_min_frame_gap or args.dense_frame_interval or 1))
+                frame_gap = (
+                    10**9
+                    if last_dense_frame_idx is None
+                    else int(item.frame_idx) - int(last_dense_frame_idx)
+                )
+                translation_delta = (
+                    float("inf")
+                    if last_dense_pose is None
+                    else _translation_delta_m(last_dense_pose, pose)
+                )
+                rotation_delta = (
+                    float("inf")
+                    if last_dense_pose is None
+                    else _rotation_delta_deg(last_dense_pose, pose)
+                )
+                pixel_motion = float(item.pixel_motion)
+                gap_ready = frame_gap >= min_gap
+                motion_ready = (
+                    translation_delta >= float(args.dense_translation_thresh_m)
+                    or rotation_delta >= float(args.dense_rotation_thresh_deg)
+                    or pixel_motion >= float(args.dense_pixel_motion_thresh)
+                    or not bool(item.track_ok)
+                )
+                dense_scheduler_detail = {
+                    "dense_frame_gap": int(frame_gap if frame_gap < 10**8 else 0),
+                    "dense_translation_delta_m": float(0.0 if math.isinf(translation_delta) else translation_delta),
+                    "dense_rotation_delta_deg": float(0.0 if math.isinf(rotation_delta) else rotation_delta),
+                    "dense_pixel_motion": pixel_motion,
+                    "dense_gap_ready": bool(gap_ready),
+                    "dense_motion_ready": bool(motion_ready),
+                }
+                if not gap_ready:
+                    should_submit_dense = False
+                    dense_skip_reason = "dense_min_frame_gap"
+                    dense_interval_skips += 1
+                elif not motion_ready:
+                    should_submit_dense = False
+                    dense_skip_reason = "motion_below_threshold"
+                    dense_motion_skips += 1
             if not should_submit_dense:
                 skipped += 1
                 metrics["tracking"].append(
@@ -1940,6 +3996,12 @@ def main() -> int:
                         "match_count": int(item.match_count),
                         "inlier_count": int(item.inlier_count),
                         "pixel_motion": float(item.pixel_motion),
+                        "tracked_while_dense": bool(tracked_while_dense),
+                        "dense_busy_tracking_policy": tracking_policy,
+                        "async_tracking": bool((item.notes or {}).get("async_tracking", False)),
+                        "tracking_dense_busy": bool((item.notes or {}).get("tracking_dense_busy", False)),
+                        "tracking_target_fps": float((item.notes or {}).get("tracking_target_fps", 0.0)),
+                        **dense_scheduler_detail,
                     }
                 )
                 process_new_results()
@@ -1979,8 +4041,11 @@ def main() -> int:
                     "scheduled_window": bool(scheduled_window),
                     "queue_full_drop_delta": int(queue_full_drop_delta),
                     "worker_queue_size": int(worker_status.get("queue_size", 0)),
+                    "worker_busy": bool(worker_status.get("worker_busy", False)),
                     "worker_scheduled_windows": int(worker_status.get("scheduled_windows", 0)),
                     "worker_completed_windows": int(worker_status.get("completed_windows", 0)),
+                    "dense_seed_frames_needed": bool(dense_seed_frames_needed),
+                    **dense_scheduler_detail,
                 }
             )
             metrics["tracking"].append(
@@ -1991,19 +4056,32 @@ def main() -> int:
                     "dense_submitted": True,
                     "dense_scheduled_window": bool(scheduled_window),
                     "dense_queue_full_drop_delta": int(queue_full_drop_delta),
+                    "dense_seed_frames_needed": bool(dense_seed_frames_needed),
                     "is_keyframe": bool(item.is_keyframe),
                     "track_ok": bool(item.track_ok),
                     "keypoint_count": int(item.keypoint_count),
                     "match_count": int(item.match_count),
                     "inlier_count": int(item.inlier_count),
                     "pixel_motion": float(item.pixel_motion),
+                    "tracked_while_dense": bool(tracked_while_dense),
+                    "dense_busy_tracking_policy": tracking_policy,
+                    "async_tracking": bool((item.notes or {}).get("async_tracking", False)),
+                    "tracking_dense_busy": bool((item.notes or {}).get("tracking_dense_busy", False)),
+                    "tracking_target_fps": float((item.notes or {}).get("tracking_target_fps", 0.0)),
+                    **dense_scheduler_detail,
                 }
             )
+            if scheduled_window:
+                last_dense_frame_idx = int(item.frame_idx)
+                last_dense_pose = pose.copy()
             submitted += 1
             process_new_results()
             if args.publish_every_frames > 0 and submitted % args.publish_every_frames == 0:
                 write_started = time.perf_counter()
-                _write_live_json(output_dir, frame_points, trajectory, events, args)
+                if artifact_writer is not None:
+                    artifact_writer.submit_live_snapshot(output_dir, frame_points, trajectory, events, args)
+                else:
+                    _write_live_json(output_dir, frame_points, trajectory, events, args)
                 publish_ros_cloud()
                 metrics["live_write_sec"].append(time.perf_counter() - write_started)
             if args.frame_sleep_sec > 0:
@@ -2015,9 +4093,49 @@ def main() -> int:
         if worker.status().get("stop_requested") is False:
             worker.stop(drain=False)
 
-    _refresh_fusion_snapshot(fusion_map, frame_points, int(processed_results and len(processed_results) or 0))
+    if artifact_writer is not None:
+        artifact_writer.close(drain=True)
+    artifact_writer_status = artifact_writer.status() if artifact_writer is not None else None
+    binary_cloud_ws_status = binary_cloud_ws.status() if binary_cloud_ws is not None else None
+    global_binary_cloud_ws_status = (
+        global_binary_cloud_ws.status() if global_binary_cloud_ws is not None else None
+    )
+
+    if rolling_map is not None:
+        frame_points.clear()
+        frame_points[int(processed_results and len(processed_results) or 0)] = rolling_map.snapshot()
+    else:
+        _refresh_fusion_snapshot(fusion_map, frame_points, int(processed_results and len(processed_results) or 0))
     payload = _write_live_json(output_dir, frame_points, trajectory, events, args)
     publish_ros_cloud()
+    xyz_final, rgb_final, frames_final, semantic_label_final, semantic_conf_final, observations_final = _collect_live_arrays(frame_points)
+    rolling_map_ply = output_dir / "rolling_map.ply"
+    _write_ascii_ply(rolling_map_ply, xyz_final, rgb_final, semantic_label_final, semantic_conf_final, observations_final)
+    global_map_ply = output_dir / "global_map.ply"
+    global_xyz_final = np.zeros((0, 3), dtype=np.float32)
+    if global_map is not None:
+        global_snapshot = global_map.snapshot()
+        global_xyz_final = global_snapshot["xyz"]
+        _write_ascii_ply(
+            global_map_ply,
+            global_snapshot["xyz"],
+            global_snapshot["rgb"],
+            global_snapshot["semantic_label"],
+            global_snapshot["semantic_conf"],
+            global_snapshot["observations"],
+        )
+    trajectory_txt = output_dir / "trajectory.txt"
+    with trajectory_txt.open("w", encoding="utf-8") as handle:
+        for item in trajectory:
+            pose = np.asarray(item.get("pose"), dtype=np.float32)
+            if pose.shape != (4, 4):
+                continue
+            qx, qy, qz, qw = _matrix_to_quaternion(pose[:3, :3])
+            handle.write(
+                f"{float(item.get('timestamp_sec', 0.0)):.9f} "
+                f"{pose[0, 3]:.9f} {pose[1, 3]:.9f} {pose[2, 3]:.9f} "
+                f"{qx:.9f} {qy:.9f} {qz:.9f} {qw:.9f}\n"
+            )
     final_worker_status = worker.status()
     summary = {
         "output_dir": str(output_dir),
@@ -2026,15 +4144,36 @@ def main() -> int:
         "viewer_html": str(output_dir / "live_viewer.html"),
         "live_map_json": str(output_dir / "live_map.json"),
         "live_map_ply": str(output_dir / "live_map.ply"),
+        "metrics_json": str(output_dir / "metrics.json"),
+        "trajectory_txt": str(trajectory_txt),
+        "keyframes_dir": str(keyframe_manager.keyframe_dir),
+        "rolling_map_ply": str(rolling_map_ply),
+        "global_map_ply": str(global_map_ply) if global_map is not None else "",
+        "run_log": str(run_log_path),
         "tracked_frames": len(metrics["tracking"]),
         "submitted_frames": submitted,
         "skipped_frames": skipped,
         "dense_policy": {
             "keyframes_only": bool(args.keyframes_only),
+            "dense_scheduler": str(args.dense_scheduler),
             "dense_frame_interval": int(args.dense_frame_interval),
+            "dense_min_frame_gap": int(args.dense_min_frame_gap or args.dense_frame_interval),
+            "dense_translation_thresh_m": float(args.dense_translation_thresh_m),
+            "dense_rotation_thresh_deg": float(args.dense_rotation_thresh_deg),
+            "dense_pixel_motion_thresh": float(args.dense_pixel_motion_thresh),
+            "dense_submit_when_worker_idle": bool(args.dense_submit_when_worker_idle),
+            "dense_busy_tracking_policy": str(args.dense_busy_tracking_policy),
+            "dense_busy_tracking_min_interval_sec": float(args.dense_busy_tracking_min_interval_sec),
+            "hikrobot_async_tracking": bool(args.hikrobot_async_tracking),
+            "hikrobot_tracking_idle_fps": float(args.hikrobot_tracking_idle_fps),
+            "hikrobot_tracking_dense_fps": float(args.hikrobot_tracking_dense_fps),
+            "realsense_async_tracking": bool(args.realsense_async_tracking),
+            "realsense_tracking_idle_fps": float(args.realsense_tracking_idle_fps),
+            "realsense_tracking_dense_fps": float(args.realsense_tracking_dense_fps),
             "window_stride": int(args.stride),
             "max_queue": int(args.max_queue),
             "drop_when_busy": bool(args.no_blocking_submit),
+            "latest_only_pending": bool(args.no_blocking_submit),
         },
         "reconstruction": {
             "fusion_mode": str(args.fusion_mode),
@@ -2042,7 +4181,18 @@ def main() -> int:
             "fusion_max_points": int(args.fusion_max_points),
             "fusion_min_observations": int(args.fusion_min_observations),
             "adaptive_sampling": bool(args.adaptive_sampling),
+            "rolling_map": bool(args.rolling_map),
+            "rolling_map_voxel_size": float(args.rolling_map_voxel_size),
+            "rolling_map_max_windows": int(args.rolling_map_max_windows),
+            "rolling_map_max_age_sec": float(args.rolling_map_max_age_sec),
+            "rolling_map_point_count": int(xyz_final.shape[0]),
+            "global_map": bool(args.global_map),
+            "global_map_voxel_size": float(args.global_map_voxel_size),
+            "global_map_max_points": int(args.global_map_max_points),
+            "global_map_point_count": int(global_xyz_final.shape[0]),
             "lingbot_extrinsic_mode": str(args.lingbot_extrinsic_mode),
+            "lingbot_enable_camera": bool(args.lingbot_enable_camera),
+            "prefer_lingbot_pose": bool(args.prefer_lingbot_pose),
             "sample_stride": int(args.sample_stride),
             "sampling_pattern": str(args.sampling_pattern),
             "near_sample_stride": int(args.near_sample_stride),
@@ -2056,11 +4206,21 @@ def main() -> int:
         "dense_submitted_frames": dense_submitted_frames,
         "dense_interval_skips": dense_interval_skips,
         "dense_non_keyframe_skips": dense_non_keyframe_skips,
+        "dense_motion_skips": dense_motion_skips,
+        "dense_worker_busy_skips": dense_worker_busy_skips,
+        "dense_busy_tracking_throttle_waits": dense_busy_tracking_throttle_waits,
+        "dense_busy_tracking_steps": dense_busy_tracking_steps,
         "dense_window_schedules": dense_window_schedules,
         "dense_queue_full_drops": int(final_worker_status.get("queue_full_drops", 0)),
+        "dense_pending_window_drops": int(final_worker_status.get("pending_window_drops", 0)),
         "worker_status": final_worker_status,
         "processed_windows": len(processed_results),
+        "dense_update_count": len(processed_results),
         "point_count": int(payload["point_count"]),
+        "memory": _memory_status(),
+        "artifact_writer": artifact_writer_status,
+        "binary_cloud_ws": binary_cloud_ws_status,
+        "global_binary_cloud_ws": global_binary_cloud_ws_status,
         "elapsed_sec": time.perf_counter() - start,
         "server_url": f"http://0.0.0.0:{args.port}/live_viewer.html" if args.serve else "",
         "server_pid": int(server.pid) if server is not None else 0,
@@ -2071,11 +4231,45 @@ def main() -> int:
         "worker_elapsed_sec": _stats(metrics["worker_elapsed_sec"]),
         "worker_queue_wait_sec": _stats(metrics["worker_queue_wait_sec"]),
         "worker_end_to_end_sec": _stats(metrics["worker_end_to_end_sec"]),
+        "geometry_age_sec": _stats(metrics["geometry_age_sec"]),
+        "new_geometry_fps": _stats(
+            [
+                float(item.get("new_geometry_fps", 0.0))
+                for item in metrics["windows"]
+                if "new_geometry_fps" in item
+            ]
+        ),
+        "model_forward_sec": _stats(metrics["model_forward_sec"]),
+        "preprocess_sec": _stats(metrics["preprocess_sec"]),
+        "postprocess_sec": _stats(metrics["postprocess_sec"]),
+        "pointcloud_build_sec": _stats(metrics["pointcloud_build_sec"]),
+        "predictions_npz_load_sec": _stats(metrics["predictions_npz_load_sec"]),
+        "ros_current_publish_sec": _stats(metrics["ros_current_publish_sec"]),
+        "binary_cloud_publish_sec": _stats(metrics["binary_cloud_publish_sec"]),
+        "global_binary_cloud_publish_sec": _stats(metrics["global_binary_cloud_publish_sec"]),
+        "artifact_submit_sec": _stats(metrics["artifact_submit_sec"]),
         "process_result_sec": _stats(metrics["process_result_sec"]),
         "live_write_sec": _stats(metrics["live_write_sec"]),
         "points_added_or_replaced": _stats([float(v) for v in metrics["points_added_or_replaced"]]),
+        "rolling_map_point_count": _stats([float(v) for v in metrics["rolling_map_point_count"]]),
+        "global_map_point_count": _stats([float(v) for v in metrics["global_map_point_count"]]),
         "dense_submit_sec": _stats([float(item["submit_sec"]) for item in metrics["dense_submit"]]),
     }
+    if trajectory:
+        ts = [float(item.get("timestamp_sec", 0.0)) for item in trajectory]
+        span = max(1e-6, max(ts) - min(ts))
+        metrics_summary["pose_fps"] = float((len(ts) - 1) / span) if len(ts) > 1 else 0.0
+        if args.tracking_backend == "realsense_mono_rgb":
+            metrics_summary["rgb_fps_estimate"] = float(getattr(args, "realsense_fps", metrics_summary["pose_fps"]))
+        else:
+            metrics_summary["rgb_fps_estimate"] = float(getattr(args, "hikrobot_fps", metrics_summary["pose_fps"]))
+        metrics_summary["ros_rgb_topic_fps_estimate"] = metrics_summary["rgb_fps_estimate"]
+    if len(geometry_update_times) >= 2:
+        intervals = [
+            float(right - left)
+            for left, right in zip(list(geometry_update_times)[:-1], list(geometry_update_times)[1:])
+        ]
+        metrics_summary["geometry_update_interval_sec"] = _stats(intervals)
     metrics_payload = {
         "summary": summary,
         "latency": metrics_summary,
@@ -2085,9 +4279,14 @@ def main() -> int:
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (output_dir / "full_stack_metrics.json").write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+    (output_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     if ros_bridge is not None:
         ros_bridge.close()
+    if binary_cloud_ws is not None:
+        binary_cloud_ws.close()
+    if global_binary_cloud_ws is not None:
+        global_binary_cloud_ws.close()
     return 0
 
 

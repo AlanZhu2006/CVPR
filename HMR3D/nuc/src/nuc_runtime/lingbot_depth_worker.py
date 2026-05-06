@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,6 +39,10 @@ class LingBotDepthWorkerConfig:
     model_depth: int = 0
     model_num_heads: int = 0
     model_mlp_ratio: float = 0.0
+    compile_model: bool = False
+    compile_warmup_passes: int = 3
+    compile_warmup_stream_frames: int = 10
+    persistent_streaming: bool = False
     compress_outputs: bool = True
     preload_model: bool = False
     warmup_first_window: bool = False
@@ -94,8 +99,13 @@ class LingBotDepthWorker:
         self._completed_windows = 0
         self._failed_windows = 0
         self._queue_full_drops = 0
+        self._pending_window_drops = 0
+        self._active_window_index: int | None = None
+        self._preloading_model = bool(config.preload_model)
+        self._dense_state = "IDLE"
         self._last_result: LingBotWindowResult | None = None
         self._last_error: str | None = None
+        self._error_events: deque[dict[str, Any]] = deque(maxlen=16)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -137,14 +147,20 @@ class LingBotDepthWorker:
             "frames": [asdict(frame) for frame in self._frames],
             "queued_monotonic_sec": time.perf_counter(),
         }
-        try:
-            self._queue.put(payload, block=block, timeout=None if block else 0)
-        except queue.Full:
-            with self._lock:
-                self._queue_full_drops += 1
-                self._last_error = "queue_full"
-            self._write_status()
-            return False
+        if block:
+            self._queue.put(payload, block=True)
+        else:
+            while True:
+                try:
+                    self._queue.put_nowait(payload)
+                    break
+                except queue.Full:
+                    if not self._drop_oldest_pending_window():
+                        with self._lock:
+                            self._queue_full_drops += 1
+                            self._last_error = "queue_full"
+                        self._write_status()
+                        return False
         self._scheduled_windows += 1
         self._write_status()
         return True
@@ -153,7 +169,7 @@ class LingBotDepthWorker:
         self._queue.join()
         while True:
             with self._lock:
-                done = self._completed_windows + self._failed_windows
+                done = self._completed_windows + self._failed_windows + self._pending_window_drops
                 scheduled = self._scheduled_windows
             if done >= scheduled:
                 return
@@ -163,6 +179,9 @@ class LingBotDepthWorker:
         if drain:
             self.wait_until_idle()
         self._stop_requested = True
+        if not drain:
+            while self._drop_oldest_pending_window():
+                pass
         self._queue.put(None)
         if self._thread is not None:
             self._thread.join(timeout=30)
@@ -177,11 +196,32 @@ class LingBotDepthWorker:
                 "completed_windows": self._completed_windows,
                 "failed_windows": self._failed_windows,
                 "queue_full_drops": self._queue_full_drops,
+                "pending_window_drops": self._pending_window_drops,
+                "active_window_index": self._active_window_index,
+                "preloading_model": self._preloading_model,
+                "dense_state": self._dense_state,
+                "worker_busy": self._preloading_model or self._active_window_index is not None,
                 "queue_size": self._queue.qsize(),
                 "stop_requested": self._stop_requested,
                 "last_error": self._last_error,
+                "error_events": list(self._error_events),
                 "last_result": asdict(self._last_result) if self._last_result else None,
             }
+
+    def _drop_oldest_pending_window(self) -> bool:
+        try:
+            dropped = self._queue.get_nowait()
+        except queue.Empty:
+            return False
+        if dropped is None:
+            self._queue.task_done()
+            return False
+        self._queue.task_done()
+        with self._lock:
+            self._queue_full_drops += 1
+            self._pending_window_drops += 1
+            self._last_error = "dropped_old_pending_window_for_latest"
+        return True
 
     def _run(self) -> None:
         reconstructor = LingBotReconstructor(
@@ -206,23 +246,66 @@ class LingBotDepthWorker:
             model_depth=self.config.model_depth,
             model_num_heads=self.config.model_num_heads,
             model_mlp_ratio=self.config.model_mlp_ratio,
+            compile_model=self.config.compile_model,
+            compile_warmup_passes=self.config.compile_warmup_passes,
+            compile_warmup_stream_frames=self.config.compile_warmup_stream_frames,
+            persistent_streaming=self.config.persistent_streaming,
+            dense_state_callback=self._set_dense_state,
         )
         if self.config.preload_model:
-            reconstructor.preload()
+            with self._lock:
+                self._preloading_model = True
+                self._dense_state = "PREPROCESSING"
+            self._write_status()
+            try:
+                reconstructor.preload()
+            finally:
+                with self._lock:
+                    self._preloading_model = False
+                    self._dense_state = "IDLE"
+                self._write_status()
         while True:
             payload = self._queue.get()
             if payload is None:
                 self._queue.task_done()
                 break
             try:
+                with self._lock:
+                    self._active_window_index = int(payload.get("index", -1))
+                    self._dense_state = "PREPROCESSING"
+                self._write_status()
                 self._process_window(reconstructor, payload)
             except BaseException as exc:
+                window_index = int(payload.get("index", -1))
+                message = f"{type(exc).__name__}: {exc}"
+                trace = traceback.format_exc()
+                print(
+                    f"LingBot dense worker failed for window {window_index}: {message}\n{trace}",
+                    flush=True,
+                )
                 with self._lock:
                     self._failed_windows += 1
-                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    self._last_error = message
+                    self._error_events.append(
+                        {
+                            "time_sec": time.time(),
+                            "window_index": window_index,
+                            "error": message,
+                            "traceback": trace,
+                        }
+                    )
                 self._write_status()
             finally:
+                with self._lock:
+                    self._active_window_index = None
+                    self._dense_state = "IDLE"
                 self._queue.task_done()
+                self._write_status()
+
+    def _set_dense_state(self, state: str) -> None:
+        with self._lock:
+            self._dense_state = str(state)
+        self._write_status()
 
     def _process_window(self, reconstructor: LingBotReconstructor, payload: dict[str, Any]) -> None:
         index = int(payload["index"])
@@ -257,6 +340,9 @@ class LingBotDepthWorker:
             compress_outputs=self.config.compress_outputs,
         )
         finished = time.perf_counter()
+        with self._lock:
+            self._dense_state = "PUBLISHING"
+        self._write_status()
         elapsed = finished - start
         result = LingBotWindowResult(
             index=index,
