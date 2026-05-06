@@ -1181,3 +1181,202 @@ trajectory 是否落在合理相机位置附近
    ```
 
    `CAMERA_UNDISTORT=1` 会在 HikRobot 帧进入 cuVSLAM / LingBot 前先去畸变，并使用新的 pinhole K；如果想让 cuVSLAM 自己吃 Brown 畸变模型，可以设 `CAMERA_UNDISTORT=0` 做对比。
+
+## A6000 部署说明
+
+这一节给迁移到 A6000 的机器使用。当前项目已经拆成两个路径：
+
+```text
+主线:
+  offline / semi-offline RGB video
+  -> LingBot or Mem3R
+  -> world_points / pose / depth / confidence
+  -> TSDF / mesh / occupancy
+  -> Gaussian seed / GS-SDF / 3DGS optimization
+  -> GS Console / Isaac Sim / robot simulation assets
+
+备份实时链路:
+  Jetson camera / ROS / cuVSLAM / async LingBot / WebUI
+```
+
+A6000 应该承担主线中的重计算部分：
+
+```text
+LingBot / Mem3R inference
+TSDF / mesh fusion
+Gaussian seed generation
+GS-SDF / SplaTAM / 3DGS optimization
+high-quality render / evaluation
+WebUI playback of reconstructed scene
+```
+
+Jetson 只保留为 camera / robot-side runtime：
+
+```text
+HikRobot / RealSense capture
+ROS2 camera topics
+low-latency preview
+Nav2 / robot control
+```
+
+### 迁移方式
+
+不要把 checkpoint、视频和 `nuc_output/` 全部提交进 git。推荐从 Jetson 用 rsync 同步运行包：
+
+```bash
+cd /home/nvidia/twork/lingbot-map
+
+A6000_SSH=user@a6000-host \
+A6000_ROOT=/data/lingbot-map \
+bash GS_Console/scripts/prepare_a6000_migration_bundle.sh
+```
+
+如果需要把整个 `CVPR/nuc_output/` 也搬过去：
+
+```bash
+cd /home/nvidia/twork/lingbot-map
+
+INCLUDE_ALL_NUC_OUTPUT=1 \
+A6000_SSH=user@a6000-host \
+A6000_ROOT=/data/lingbot-map \
+bash GS_Console/scripts/prepare_a6000_migration_bundle.sh
+```
+
+默认会迁移：
+
+```text
+GS_Console/
+CVPR/HMR3D/
+CVPR/README.md
+CVPR/command.txt
+CVPR/third_party_research/lingbot-map/
+CVPR/third_party_research/SplaTAM/
+CVPR/third_party_research/lingbot_cache/lingbot-map.pt
+videos/
+CVPR/nuc_output/video_real2sim_playback/
+CVPR/nuc_output/real2sim_hikrobot_lingbot_live_baseline/
+CVPR/nuc_output/hikrobot_lingbot_ros2_current_cloud_live/
+```
+
+### A6000 环境准备
+
+A6000 不需要 Jetson 的 HikRobot / RealSense SDK 才能跑 offline 主线。它需要：
+
+```text
+CUDA / PyTorch GPU 环境
+Python packages for LingBot
+Node.js / npm for GS Console WebUI
+OpenCV / numpy / pillow / scikit-image
+optional: gsplat / SplaTAM / GS-SDF dependencies
+```
+
+最小 smoke test 先跑 LingBot export：
+
+```bash
+cd /data/lingbot-map/CVPR
+
+python HMR3D/nuc/scripts/run_lingbot_export.py \
+  --model-path third_party_research/lingbot_cache/lingbot-map.pt \
+  --lingbot-map-root third_party_research/lingbot-map \
+  --image-folder ../videos/vid_frames \
+  --output-dir nuc_output/video_real2sim_playback/lingbot_vid20 \
+  --first-k 20 \
+  --image-size 518 \
+  --model-image-size 518 \
+  --mode streaming \
+  --keyframe-interval 2 \
+  --camera-num-iterations 1
+```
+
+如果 A6000 上 FlashInfer / compile 还没配好，可以先加：
+
+```bash
+--use-sdpa
+```
+
+输出应包含：
+
+```text
+nuc_output/video_real2sim_playback/lingbot_vid20/lingbot_predictions.npz
+nuc_output/video_real2sim_playback/lingbot_vid20/lingbot_summary.json
+```
+
+并且 `prediction_keys` 应该包含：
+
+```text
+world_points
+world_points_conf
+depth
+depth_conf
+extrinsic
+intrinsic
+```
+
+### A6000 WebUI 回放
+
+用 LingBot 输出启动 GS Console live-style playback：
+
+```bash
+cd /data/lingbot-map
+
+LINGBOT_PREDICTIONS_NPZ=/data/lingbot-map/CVPR/nuc_output/video_real2sim_playback/lingbot_vid20/lingbot_predictions.npz \
+LINGBOT_SUMMARY_JSON=/data/lingbot-map/CVPR/nuc_output/video_real2sim_playback/lingbot_vid20/lingbot_summary.json \
+NORMALIZE_LINGBOT_WORLD=1 \
+PLAYBACK_FPS=2 \
+MAX_FRAMES=20 \
+POINTS_PER_FRAME=12000 \
+MAX_GLOBAL_POINTS=180000 \
+bash GS_Console/scripts/launch_video_real2sim_playback_stack.sh
+```
+
+打开：
+
+```text
+http://A6000_IP:5173/?scene=/scenes/lingbot-live/manifest.json&mode=live&liveContract=/contracts/lingbot-map-video-playback.live-contract.json
+```
+
+WebUI 布局：
+
+```text
+主屏幕: live RGB playback
+左上角: LingBot world_points 累积 global map / Gaussian seed preview
+左下角: 当前帧 colored point cloud
+右下角: Nav2-style 2D projection placeholder
+```
+
+注意：如果不传 `LINGBOT_PREDICTIONS_NPZ`，系统会 fallback 到 synthetic RGB-depth scaffold。那个模式只用于测试 WebUI/WS 链路，左上角会像一张方框状 RGB 点云，不代表真实重建。
+
+### A6000 后续执行顺序
+
+1. 跑 20 帧 smoke test，确认 LingBot 输出 `world_points`。
+2. 扩到完整视频或 20-60 秒片段。
+3. 用 `export_lingbot_worker_to_real2sim.py` 或后续 video bundle exporter 生成：
+
+   ```text
+   scene_points.ply
+   scene_mesh.ply
+   gaussians_seed.npz
+   gaussians_seed.ply
+   manifest.json
+   ```
+
+4. 在 A6000 上跑 Gaussian / GS-SDF / SplaTAM 优化。
+5. 导出 Nav2 / Isaac Sim 所需 mesh、occupancy、collision assets。
+
+### 当前已推送的代码位置
+
+```text
+GS_Console:
+  commit 6eae7c1 Add LingBot video playback and A6000 migration tools
+
+CVPR:
+  commit 02293fd Add LingBot real-to-sim backend and playback tools
+```
+
+A6000 可以直接 clone 这两个仓库，但大文件仍需要 rsync / shared storage：
+
+```text
+lingbot-map.pt
+videos/
+nuc_output/
+```
