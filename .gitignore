@@ -6,12 +6,24 @@
 __pycache__/
 *.py[cod]
 .venv*/
+.pytest_cache/
 
 # Large local datasets and generated artifacts
 datasets/
 nuc_output/
 HMR3D/nuc_output/
 map.json
+cache/
+outputs/
+runtime/
+videos/*_frames*/
+GS_Console/runtime/
+GS_Console/examples/web-ui/node_modules/
+GS_Console/examples/web-ui/dist/
+GS_Console/examples/web-ui/public/videos/*
+!GS_Console/examples/web-ui/public/videos/.gitkeep
+GS_Console/optix7cache.db*
+*.tsbuildinfo
 
 # External dependencies kept local
 cuVSLAM/
@@ -23,6 +35,10 @@ third_party_research/lingbot-map/**/*.py[cod]
 *.pt
 *.pth
 *.ckpt
+*.safetensors
+*.ply
+*.spz
+*.npz
+*.rrd
 third_party_research/lingbot-map
-third_party_research/SplaTAM
 third_party_research/SplaTAM

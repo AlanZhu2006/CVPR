@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "slam-adapter.live-contract/v1alpha1",
+  "contractId": "lingbot-map-viser",
+  "displayName": "LingBot-Map Viser Viewer",
+  "transportHints": {
+    "preferredBridge": "http",
+    "defaultUrlEnv": "LINGBOT_VIEWER_URL",
+    "notes": "LingBot-Map demo.py starts a browser-based viser server, normally on http://localhost:8080."
+  },
+  "selectionPolicy": {
+    "profilePriority": [
+      "external-viewer"
+    ],
+    "preferFirstActive": true
+  },
+  "channels": [
+    {
+      "key": "external_viewer",
+      "profile": "external-viewer",
+      "direction": "request",
+      "transport": "http",
+      "endpoint": "http://localhost:8080",
+      "semanticType": "external_viewer",
+      "frameIdPolicy": "not_applicable",
+      "required": false,
+      "enabledByDefault": true,
+      "notes": "Open this endpoint to inspect LingBot-Map point clouds, cameras, and depth-derived geometry in viser."
+    }
+  ]
+}

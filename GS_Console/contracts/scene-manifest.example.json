@@ -1,0 +1,136 @@
+{
+  "schemaVersion": "slam-adapter.scene-manifest/v1alpha1",
+  "sceneId": "campus_demo",
+  "frameId": "world",
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "fx": 611.3,
+    "fy": 610.8,
+    "cx": 640.0,
+    "cy": 360.0,
+    "tCL": null,
+    "tBL": null
+  },
+  "initialView": {
+    "pose": {
+      "position": {
+        "x": 2.4,
+        "y": -1.2,
+        "z": 1.8
+      },
+      "orientation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.2588190451,
+        "w": 0.9659258263
+      },
+      "frameId": "world"
+    },
+    "target": {
+      "x": 5.5,
+      "y": 0.8,
+      "z": 0.2
+    }
+  },
+  "gaussian": {
+    "format": "gs-chunks",
+    "chunks": [
+      {
+        "id": "chunk_000",
+        "url": "/scenes/campus_demo/model/gaussian/chunk_000.spz",
+        "bytes": 1784123,
+        "splats": 182451,
+        "center": {
+          "x": 4.0,
+          "y": 1.0,
+          "z": 0.6
+        }
+      },
+      {
+        "id": "chunk_001",
+        "url": "/scenes/campus_demo/model/gaussian/chunk_001.spz",
+        "bytes": 1622451,
+        "splats": 169008,
+        "center": {
+          "x": 10.0,
+          "y": 1.4,
+          "z": 0.7
+        }
+      }
+    ],
+    "shDegree": 2,
+    "variant": "quality",
+    "label": "Quality"
+  },
+  "gaussianVariants": {
+    "quality": {
+      "format": "gs-chunks",
+      "chunks": [
+        {
+          "id": "chunk_000",
+          "url": "/scenes/campus_demo/model/gaussian/chunk_000.spz"
+        }
+      ],
+      "shDegree": 2,
+      "variant": "quality",
+      "label": "Quality"
+    },
+    "balanced": {
+      "format": "spz",
+      "url": "/scenes/campus_demo/model/gs_runtime.spz",
+      "shDegree": 1,
+      "variant": "balanced",
+      "label": "Balanced"
+    }
+  },
+  "occupancy": {
+    "source": "as_occ_prior",
+    "url": "/scenes/campus_demo/model/as_occ_prior.ply",
+    "resolution": 0.1,
+    "origin": {
+      "x": -20.0,
+      "y": -18.0
+    }
+  },
+  "mesh": {
+    "format": "ply",
+    "url": "/scenes/campus_demo/model/mesh_post.ply"
+  },
+  "rawPointCloud": {
+    "format": "ply",
+    "url": "/scenes/campus_demo/model/raw_pointcloud.ply"
+  },
+  "training": {
+    "status": "completed",
+    "outputDir": "/data/gs-sdf/output/campus_demo",
+    "configPath": "/data/gs-sdf/configs/campus_demo.yaml"
+  },
+  "robot": {
+    "radius": 0.28,
+    "height": 0.45
+  },
+  "meta": {
+    "leafSize": 0.1,
+    "mapOrigin": {
+      "x": -20.0,
+      "y": -18.0,
+      "z": -1.0
+    },
+    "mapSize": 64.0
+  },
+  "assets": {
+    "gaussian": "ready",
+    "mesh": "ready",
+    "occupancy": "ready",
+    "rawPointCloud": "fallback"
+  },
+  "source": {
+    "kind": "gssdf",
+    "outputDir": "/data/gs-sdf/output/campus_demo",
+    "repoPath": "/media/chatsign/data-002/gs-sdf",
+    "repoCommit": "abcdef1234567890",
+    "liveContractUrl": "/contracts/live-contract.default.json",
+    "capabilityMatrixUrl": "/contracts/adapter-capability-matrix.default.json"
+  }
+}

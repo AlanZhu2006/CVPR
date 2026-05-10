@@ -1,0 +1,123 @@
+{
+  "schemaVersion": "slam-adapter.live-contract/v1alpha1",
+  "contractId": "lingbot-map-ros2-live",
+  "displayName": "LingBot-Map ROS2 live RGB / cloud / Nav2 contract",
+  "transportHints": {
+    "preferredBridge": "rosbridge_suite",
+    "defaultUrlEnv": "ROSBRIDGE_URL",
+    "notes": "Use ROS2 rosbridge_websocket with the LingBot live reconstruction bridge. All visual streams are best-effort and UI-throttled."
+  },
+  "selectionPolicy": {
+    "profilePriority": [
+      "neural",
+      "navigation"
+    ],
+    "preferFirstActive": true
+  },
+  "channels": [
+    {
+      "key": "robot_pose",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/neural_mapping/pose",
+      "messageType": "geometry_msgs/PoseStamped",
+      "semanticType": "pose3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 15
+    },
+    {
+      "key": "trajectory",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/lingbot_nav/trajectory",
+      "messageType": "nav_msgs/Path",
+      "semanticType": "trajectory3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 5
+    },
+    {
+      "key": "live_point_cloud",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/lingbot/current_cloud_rgb",
+      "messageType": "sensor_msgs/PointCloud2",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 5,
+      "notes": "Current LingBot colored cloud. This matches the command.txt live path and gives the WebUI a low-latency visible layer."
+    },
+    {
+      "key": "rgb_frame",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/hikrobot/image_raw",
+      "messageType": "sensor_msgs/Image",
+      "semanticType": "image_rgb",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 8
+    },
+    {
+      "key": "playback_current_scan_world",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/lingbot/cloud_rgb",
+      "messageType": "sensor_msgs/PointCloud2",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 1,
+      "notes": "Global fused LingBot colored cloud from the command.txt live path."
+    },
+    {
+      "key": "nav_goal",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "ros_topic",
+      "topic": "/goal_pose",
+      "messageType": "geometry_msgs/PoseStamped",
+      "semanticType": "nav_goal",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "notes": "Nav2-style goal topic. The lightweight bridge also listens here."
+    },
+    {
+      "key": "initial_pose",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "ros_topic",
+      "topic": "/initialpose",
+      "messageType": "geometry_msgs/PoseWithCovarianceStamped",
+      "semanticType": "initial_pose",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true
+    },
+    {
+      "key": "camera_pose",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "ros_topic",
+      "topic": "/rviz/current_camera_pose",
+      "messageType": "geometry_msgs/Pose",
+      "semanticType": "camera_pose",
+      "frameIdPolicy": "not_applicable",
+      "required": false,
+      "enabledByDefault": true
+    }
+  ]
+}

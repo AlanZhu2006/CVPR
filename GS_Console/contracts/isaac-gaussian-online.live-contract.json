@@ -1,0 +1,97 @@
+{
+  "schemaVersion": "slam-adapter.live-contract/v1alpha1",
+  "contractId": "isaac-gaussian-online-http",
+  "displayName": "Isaac Gaussian Online Bridge",
+  "transportHints": {
+    "preferredBridge": "http",
+    "notes": "Isaac publishes robot pose and camera products to a standalone HTTP bridge. The bridge can optionally forward render poses to an external Gaussian renderer."
+  },
+  "selectionPolicy": {
+    "profilePriority": ["neural", "external-viewer", "navigation"],
+    "preferFirstActive": true
+  },
+  "channels": [
+    {
+      "key": "robot_pose",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/__isaac_gaussian_online/robot_pose",
+      "semanticType": "pose3d",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 6
+    },
+    {
+      "key": "trajectory",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/__isaac_gaussian_online/trajectory.json",
+      "semanticType": "trajectory3d",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 1
+    },
+    {
+      "key": "live_point_cloud",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/__isaac_gaussian_online/live_point_cloud.json",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 2
+    },
+    {
+      "key": "rgb_frame",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/__isaac_gaussian_online/frame/rgb.jpg",
+      "semanticType": "image_rgb",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 6
+    },
+    {
+      "key": "depth_frame",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/__isaac_gaussian_online/frame/depth.jpg",
+      "semanticType": "image_depth",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 6
+    },
+    {
+      "key": "external_viewer",
+      "profile": "external-viewer",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/__isaac_gaussian_online",
+      "semanticType": "external_viewer",
+      "frameIdPolicy": "not_applicable",
+      "required": false,
+      "enabledByDefault": true
+    },
+    {
+      "key": "camera_pose",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "http",
+      "endpoint": "/__isaac_gaussian_online/camera_pose",
+      "semanticType": "camera_pose",
+      "frameIdPolicy": "not_applicable",
+      "required": false,
+      "enabledByDefault": true
+    }
+  ]
+}

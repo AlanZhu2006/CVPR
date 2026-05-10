@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chatsign.local/schemas/live-contract.schema.json",
+  "title": "SLAM Adapter Live Contract",
+  "description": "Canonical live transport contract for online SLAM feeds, playback bridges, and navigation publishers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractId",
+    "channels"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "slam-adapter.live-contract/v1alpha1"
+    },
+    "contractId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "transportHints": {
+      "$ref": "#/$defs/transportHints"
+    },
+    "selectionPolicy": {
+      "$ref": "#/$defs/selectionPolicy"
+    },
+    "channels": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/channel"
+      }
+    }
+  },
+  "$defs": {
+    "transportHints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preferredBridge": {
+          "type": "string"
+        },
+        "defaultUrlEnv": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "selectionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profilePriority": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "preferFirstActive": {
+          "type": "boolean"
+        }
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "direction",
+        "transport",
+        "semanticType",
+        "required"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "profile": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "subscribe",
+            "publish",
+            "request",
+            "response"
+          ]
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "ros_topic",
+            "foxglove_topic",
+            "websocket",
+            "http",
+            "custom"
+          ]
+        },
+        "topic": {
+          "type": "string",
+          "minLength": 1
+        },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "messageType": {
+          "type": "string",
+          "minLength": 1
+        },
+        "semanticType": {
+          "type": "string",
+          "enum": [
+            "pose3d",
+            "trajectory3d",
+            "odometry3d",
+            "pointcloud3d",
+            "image_rgb",
+            "image_depth",
+            "nav_goal",
+            "initial_pose",
+            "camera_pose",
+            "status",
+            "metrics",
+            "mesh3d",
+            "tf",
+            "external_viewer"
+          ]
+        },
+        "frameIdPolicy": {
+          "type": "string",
+          "enum": [
+            "message_header",
+            "manifest_frame",
+            "fixed_value",
+            "external_tf",
+            "not_applicable"
+          ]
+        },
+        "fixedFrameId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "enabledByDefault": {
+          "type": "boolean"
+        },
+        "fallbackKeys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rateHz": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "transport": {
+                "enum": [
+                  "ros_topic",
+                  "foxglove_topic"
+                ]
+              }
+            },
+            "required": [
+              "transport"
+            ]
+          },
+          "then": {
+            "required": [
+              "topic",
+              "messageType"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "transport": {
+                "enum": [
+                  "websocket",
+                  "http",
+                  "custom"
+                ]
+              }
+            },
+            "required": [
+              "transport"
+            ]
+          },
+          "then": {
+            "required": [
+              "endpoint"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "frameIdPolicy": {
+                "const": "fixed_value"
+              }
+            },
+            "required": [
+              "frameIdPolicy"
+            ]
+          },
+          "then": {
+            "required": [
+              "fixedFrameId"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

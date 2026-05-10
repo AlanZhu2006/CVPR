@@ -1,0 +1,35 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+.codex
+.write_test
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node / frontend build
+examples/web-ui/node_modules/
+examples/web-ui/dist/
+examples/web-ui/*.tsbuildinfo
+npm-debug.log*
+
+# Runtime-generated data
+runtime/
+*.bag
+*.db3
+*.mcap
+*.zip
+optix7cache.db*
+
+# Local scene packs generated from runtime assets
+examples/web-ui/public/scenes/*
+!examples/web-ui/public/scenes/.gitkeep
+
+# Local scratch / commands
+command.txt
+
+# Large local assets
+cbd_gs.ply

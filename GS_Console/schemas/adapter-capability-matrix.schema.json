@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chatsign.local/schemas/adapter-capability-matrix.schema.json",
+  "title": "SLAM Adapter Capability Matrix",
+  "description": "Registry of what each SLAM adapter can produce, stream, and publish.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "matrixId",
+    "adapters"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "slam-adapter.adapter-capability-matrix/v1alpha1"
+    },
+    "matrixId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "adapters": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/adapter"
+      }
+    }
+  },
+  "$defs": {
+    "artifactCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "support"
+      ],
+      "properties": {
+        "support": {
+          "type": "string",
+          "enum": [
+            "native",
+            "derived",
+            "passthrough",
+            "fallback",
+            "none"
+          ]
+        },
+        "formats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gaussian": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "mesh": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "occupancy": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "rawPointCloud": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "semantics": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "trajectory": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "rgb": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "depth": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "evaluation": {
+          "$ref": "#/$defs/artifactCapability"
+        },
+        "externalViewer": {
+          "$ref": "#/$defs/artifactCapability"
+        }
+      }
+    },
+    "liveCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profiles",
+        "transports",
+        "inboundChannels",
+        "outboundChannels"
+      ],
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "transports": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "inboundChannels": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "outboundChannels": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "canonicalContract": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "navigationCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "publishGoal": {
+          "type": "boolean"
+        },
+        "publishInitialPose": {
+          "type": "boolean"
+        },
+        "publishCameraPose": {
+          "type": "boolean"
+        }
+      }
+    },
+    "sceneManifestCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "produces"
+      ],
+      "properties": {
+        "produces": {
+          "type": "boolean"
+        },
+        "producerScript": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapterId",
+        "displayName",
+        "sourceKind",
+        "integrationMode",
+        "artifacts",
+        "live"
+      ],
+      "properties": {
+        "adapterId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceKind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "integrationMode": {
+          "type": "string",
+          "enum": [
+            "scene-pack",
+            "ros-live",
+            "playback-cache",
+            "hybrid",
+            "importer-only"
+          ]
+        },
+        "artifacts": {
+          "$ref": "#/$defs/artifacts"
+        },
+        "live": {
+          "$ref": "#/$defs/liveCapability"
+        },
+        "navigation": {
+          "$ref": "#/$defs/navigationCapability"
+        },
+        "sceneManifest": {
+          "$ref": "#/$defs/sceneManifestCapability"
+        },
+        "examples": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

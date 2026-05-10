@@ -1,0 +1,536 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chatsign.local/schemas/scene-manifest.schema.json",
+  "title": "SLAM Adapter Scene Manifest",
+  "description": "Canonical scene-pack contract consumed by the GS-SDF web UI and importer pipeline.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sceneId",
+    "frameId"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "slam-adapter.scene-manifest/v1alpha1"
+    },
+    "sceneId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "frameId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "camera": {
+      "$ref": "#/$defs/cameraConfig"
+    },
+    "initialView": {
+      "$ref": "#/$defs/sceneInitialView"
+    },
+    "gaussian": {
+      "$ref": "#/$defs/gaussianSource"
+    },
+    "gaussianVariants": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/gaussianSource"
+      }
+    },
+    "occupancy": {
+      "$ref": "#/$defs/occupancySource"
+    },
+    "mesh": {
+      "$ref": "#/$defs/meshSource"
+    },
+    "rawPointCloud": {
+      "$ref": "#/$defs/pointCloudSource"
+    },
+    "externalViewer": {
+      "$ref": "#/$defs/externalViewer"
+    },
+    "training": {
+      "$ref": "#/$defs/trainingInfo"
+    },
+    "robot": {
+      "$ref": "#/$defs/robotInfo"
+    },
+    "meta": {
+      "$ref": "#/$defs/sceneMeta"
+    },
+    "assets": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/artifactState"
+      }
+    },
+    "source": {
+      "$ref": "#/$defs/sourceInfo"
+    }
+  },
+  "$defs": {
+    "nullableNumber": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "vec3": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      }
+    },
+    "quaternion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x",
+        "y",
+        "z",
+        "w"
+      ],
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        },
+        "w": {
+          "type": "number"
+        }
+      }
+    },
+    "bounds3Box": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min",
+        "max"
+      ],
+      "properties": {
+        "min": {
+          "$ref": "#/$defs/vec3"
+        },
+        "max": {
+          "$ref": "#/$defs/vec3"
+        }
+      }
+    },
+    "pose3D": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "position",
+        "orientation",
+        "frameId"
+      ],
+      "properties": {
+        "position": {
+          "$ref": "#/$defs/vec3"
+        },
+        "orientation": {
+          "$ref": "#/$defs/quaternion"
+        },
+        "frameId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stampMs": {
+          "type": "integer"
+        }
+      }
+    },
+    "sceneInitialView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pose"
+      ],
+      "properties": {
+        "pose": {
+          "$ref": "#/$defs/pose3D"
+        },
+        "target": {
+          "$ref": "#/$defs/vec3"
+        }
+      }
+    },
+    "cameraConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "width": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "height": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fx": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "fy": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "cx": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "cy": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "tCL": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number"
+          }
+        },
+        "tBL": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "gaussianChunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "splats": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "center": {
+          "$ref": "#/$defs/vec3"
+        },
+        "bounds": {
+          "$ref": "#/$defs/bounds3Box"
+        }
+      }
+    },
+    "gaussianSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "shDegree"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "gs-ply",
+            "spz",
+            "splat",
+            "gs-chunks"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chunks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/gaussianChunk"
+          }
+        },
+        "shDegree": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "variant": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "gs-chunks"
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "required": [
+              "chunks"
+            ]
+          },
+          "else": {
+            "required": [
+              "url"
+            ]
+          }
+        }
+      ]
+    },
+    "occupancySource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "url",
+        "resolution",
+        "origin"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "as_occ_prior",
+            "mesh_projection",
+            "prebuilt_grid"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "origin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "x",
+            "y"
+          ],
+          "properties": {
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    "meshSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "url"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "ply",
+            "glb"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "pointCloudSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "url"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "ply",
+            "pcd"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "externalViewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "trainingInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "outputDir"
+      ],
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "outputDir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "robotInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "radius",
+        "height"
+      ],
+      "properties": {
+        "radius": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "height": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "sceneMeta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "leafSize": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "mapOrigin": {
+          "$ref": "#/$defs/vec3"
+        },
+        "mapSize": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "artifactState": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "missing",
+        "fallback",
+        "processing",
+        "error",
+        "derived"
+      ]
+    },
+    "sourceInfo": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "outputDir": {
+          "type": "string"
+        },
+        "repoPath": {
+          "type": "string"
+        },
+        "repoCommit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "liveContractUrl": {
+          "type": "string"
+        },
+        "capabilityMatrixUrl": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

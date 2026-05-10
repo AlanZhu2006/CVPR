@@ -1,0 +1,81 @@
+{
+  "schemaVersion": "slam-adapter.live-contract/v1alpha1",
+  "contractId": "lingbot-map-video-playback",
+  "displayName": "LingBot video playback real-to-sim contract",
+  "transportHints": {
+    "preferredBridge": "http+binary-websocket",
+    "notes": "Offline RGB video playback uses MJPEG for RGB, binary WebSocket for current/global point clouds, and HTTP JSON for pose/trajectory status."
+  },
+  "selectionPolicy": {
+    "profilePriority": [
+      "neural",
+      "navigation"
+    ],
+    "preferFirstActive": true
+  },
+  "channels": [
+    {
+      "key": "robot_pose",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/lingbot-live-assets/live/pose.json",
+      "messageType": "application/json",
+      "semanticType": "pose3d",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 5
+    },
+    {
+      "key": "trajectory",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "http",
+      "endpoint": "/lingbot-live-assets/live/trajectory.json",
+      "messageType": "application/json",
+      "semanticType": "trajectory3d",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 2
+    },
+    {
+      "key": "live_point_cloud",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "custom",
+      "endpoint": "/lingbot-live-assets/live/metrics.json",
+      "messageType": "application/json",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": false,
+      "notes": "The actual cloud stream is served by ws://<host>:19093/cloud and ws://<host>:19094/cloud; this endpoint keeps the HTTP live state connected."
+    },
+    {
+      "key": "nav_goal",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "custom",
+      "endpoint": "/lingbot-live-assets/live/nav_goal.json",
+      "messageType": "application/json",
+      "semanticType": "nav_goal",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": false
+    },
+    {
+      "key": "initial_pose",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "custom",
+      "endpoint": "/lingbot-live-assets/live/initial_pose.json",
+      "messageType": "application/json",
+      "semanticType": "initial_pose",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": false
+    }
+  ]
+}

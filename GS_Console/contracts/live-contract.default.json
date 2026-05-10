@@ -1,0 +1,208 @@
+{
+  "schemaVersion": "slam-adapter.live-contract/v1alpha1",
+  "contractId": "default-rosbridge-neural-playback",
+  "displayName": "Default ROS bridge contract for neural mapping and playback",
+  "transportHints": {
+    "preferredBridge": "rosbridge_suite",
+    "defaultUrlEnv": "ROSBRIDGE_URL",
+    "notes": "Use neural topics when active, otherwise fall back to playback topics."
+  },
+  "selectionPolicy": {
+    "profilePriority": [
+      "neural",
+      "playback",
+      "navigation"
+    ],
+    "preferFirstActive": true
+  },
+  "channels": [
+    {
+      "key": "robot_pose",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/neural_mapping/pose",
+      "messageType": "geometry_msgs/PoseStamped",
+      "semanticType": "pose3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "fallbackKeys": [
+        "playback_odometry"
+      ],
+      "rateHz": 30
+    },
+    {
+      "key": "trajectory",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/neural_mapping/path",
+      "messageType": "nav_msgs/Path",
+      "semanticType": "trajectory3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 10
+    },
+    {
+      "key": "live_point_cloud",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/neural_mapping/pointcloud",
+      "messageType": "sensor_msgs/PointCloud2",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 8
+    },
+    {
+      "key": "rgb_frame",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/neural_mapping/rgb",
+      "messageType": "sensor_msgs/Image",
+      "semanticType": "image_rgb",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 6
+    },
+    {
+      "key": "depth_frame",
+      "profile": "neural",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/neural_mapping/depth",
+      "messageType": "sensor_msgs/Image",
+      "semanticType": "image_depth",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 6
+    },
+    {
+      "key": "playback_odometry",
+      "profile": "playback",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/aft_mapped_to_init",
+      "messageType": "nav_msgs/Odometry",
+      "semanticType": "odometry3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "fallbackKeys": [
+        "robot_pose"
+      ],
+      "rateHz": 30
+    },
+    {
+      "key": "playback_scan_body",
+      "profile": "playback",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/cloud_registered_body",
+      "messageType": "sensor_msgs/PointCloud2",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "fallbackKeys": [
+        "playback_scan_body_web"
+      ],
+      "rateHz": 10
+    },
+    {
+      "key": "playback_scan_body_web",
+      "profile": "playback",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/cloud_registered_body_web",
+      "messageType": "sensor_msgs/PointCloud2",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 5
+    },
+    {
+      "key": "playback_rgb",
+      "profile": "playback",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/origin_img",
+      "messageType": "sensor_msgs/Image",
+      "semanticType": "image_rgb",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 5
+    },
+    {
+      "key": "playback_global_map",
+      "profile": "playback",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/fastlivo/global_map_web",
+      "messageType": "sensor_msgs/PointCloud2",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": true,
+      "rateHz": 1
+    },
+    {
+      "key": "playback_current_scan_world",
+      "profile": "playback",
+      "direction": "subscribe",
+      "transport": "ros_topic",
+      "topic": "/fastlivo/current_scan_world_web",
+      "messageType": "sensor_msgs/PointCloud2",
+      "semanticType": "pointcloud3d",
+      "frameIdPolicy": "message_header",
+      "required": false,
+      "enabledByDefault": false,
+      "rateHz": 3
+    },
+    {
+      "key": "nav_goal",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "ros_topic",
+      "topic": "/move_base_simple/goal",
+      "messageType": "geometry_msgs/PoseStamped",
+      "semanticType": "nav_goal",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true
+    },
+    {
+      "key": "initial_pose",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "ros_topic",
+      "topic": "/initialpose",
+      "messageType": "geometry_msgs/PoseWithCovarianceStamped",
+      "semanticType": "initial_pose",
+      "frameIdPolicy": "manifest_frame",
+      "required": false,
+      "enabledByDefault": true
+    },
+    {
+      "key": "camera_pose",
+      "profile": "navigation",
+      "direction": "publish",
+      "transport": "ros_topic",
+      "topic": "/rviz/current_camera_pose",
+      "messageType": "geometry_msgs/Pose",
+      "semanticType": "camera_pose",
+      "frameIdPolicy": "not_applicable",
+      "required": false,
+      "enabledByDefault": true
+    }
+  ]
+}

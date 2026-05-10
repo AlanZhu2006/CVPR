@@ -1,0 +1,155 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Grid1
+        - /Path1
+        - /RGB1
+        - /Depth1
+      Splitter Ratio: 0.58
+    Tree Height: 720
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Tool Properties
+    Name: Tool Properties
+    Splitter Ratio: 0.588679
+  - Class: rviz/Views
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz/Time
+    Name: Time
+    SyncMode: 0
+    SyncSource: RGB
+Preferences:
+  PromptSaveOnExit: false
+Toolbars:
+  toolButtonStyle: 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.55
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 160
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 120
+      Reference Frame: world
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /neural_mapping/vis_shift_map
+      Name: Marker
+      Namespaces:
+        "": true
+      Queue Size: 0
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 0; 255; 128
+      Enabled: true
+      Head Diameter: 0.1
+      Head Length: 0.08
+      Length: 0.18
+      Line Style: Lines
+      Line Width: 0.05
+      Name: Path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.03
+      Shaft Diameter: 0.05
+      Shaft Length: 0.06
+      Topic: /neural_mapping/path
+      Value: true
+    - Class: rviz/Image
+      Enabled: true
+      Image Rendering: background and overlay
+      Image Topic: /neural_mapping/rgb
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: RGB
+      Normalize Range: true
+      Queue Size: 2
+      Transport Hint: raw
+      Value: true
+    - Class: rviz/Image
+      Enabled: false
+      Image Rendering: background and overlay
+      Image Topic: /neural_mapping/depth
+      Max Value: 10
+      Median window: 5
+      Min Value: 0
+      Name: Depth
+      Normalize Range: true
+      Queue Size: 2
+      Transport Hint: raw
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 18; 18; 22
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 22
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Name: Orbit
+      Near Clip Distance: 0.01
+      Pitch: 0.9
+      Target Frame: world
+      Value: Orbit (rviz)
+      Yaw: 0.65
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1417
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Selection:
+    collapsed: false
+  Time:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: false
+  Width: 2560
+  X: 160
+  Y: 50

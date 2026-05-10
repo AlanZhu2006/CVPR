@@ -1,0 +1,215 @@
+{
+  "schemaVersion": "slam-adapter.adapter-capability-matrix/v1alpha1",
+  "matrixId": "default-slam-adapter-matrix",
+  "description": "Baseline capability registry for the adapters currently wired into this repository.",
+  "adapters": [
+    {
+      "adapterId": "gssdf_scene_pack",
+      "displayName": "GS-SDF Scene Pack",
+      "sourceKind": "gssdf",
+      "integrationMode": "hybrid",
+      "artifacts": {
+        "gaussian": { "support": "native", "formats": ["gs-ply", "spz", "gs-chunks"] },
+        "mesh": { "support": "native", "formats": ["ply"] },
+        "occupancy": { "support": "native", "formats": ["ply"] },
+        "trajectory": { "support": "passthrough", "formats": ["nav_msgs/Path"] },
+        "rgb": { "support": "passthrough", "formats": ["sensor_msgs/Image"] },
+        "depth": { "support": "passthrough", "formats": ["sensor_msgs/Image"] }
+      },
+      "live": {
+        "profiles": ["neural", "navigation"],
+        "transports": ["ros_topic"],
+        "inboundChannels": ["robot_pose", "trajectory", "live_point_cloud", "rgb_frame", "depth_frame"],
+        "outboundChannels": ["nav_goal", "initial_pose", "camera_pose"],
+        "canonicalContract": "/contracts/live-contract.default.json"
+      },
+      "navigation": {
+        "publishGoal": true,
+        "publishInitialPose": true,
+        "publishCameraPose": true
+      },
+      "sceneManifest": {
+        "produces": true,
+        "producerScript": "scripts/sync_scene_pack.py"
+      }
+    },
+    {
+      "adapterId": "fastlivo_playback",
+      "displayName": "FAST-LIVO Playback Bridge",
+      "sourceKind": "fastlivo",
+      "integrationMode": "playback-cache",
+      "artifacts": {
+        "trajectory": { "support": "passthrough", "formats": ["nav_msgs/Odometry"] },
+        "rawPointCloud": { "support": "passthrough", "formats": ["sensor_msgs/PointCloud2"] },
+        "rgb": { "support": "passthrough", "formats": ["sensor_msgs/Image"] }
+      },
+      "live": {
+        "profiles": ["playback", "navigation"],
+        "transports": ["ros_topic"],
+        "inboundChannels": ["playback_odometry", "playback_scan_body", "playback_scan_body_web", "playback_rgb", "playback_global_map", "playback_current_scan_world"],
+        "outboundChannels": ["nav_goal", "initial_pose", "camera_pose"],
+        "canonicalContract": "/contracts/live-contract.default.json"
+      },
+      "navigation": {
+        "publishGoal": true,
+        "publishInitialPose": true,
+        "publishCameraPose": true
+      },
+      "sceneManifest": {
+        "produces": false,
+        "producerScript": null
+      }
+    },
+    {
+      "adapterId": "lingbot_live_ros2",
+      "displayName": "LingBot Live ROS2",
+      "sourceKind": "lingbot_live_ros2",
+      "integrationMode": "ros-live",
+      "artifacts": {
+        "gaussian": { "support": "fallback", "formats": ["gs-ply", "ply"], "notes": "The current real2sim seed gaussian PLY is loaded through Spark when compatible, otherwise as a colored point layer fallback." },
+        "mesh": { "support": "native", "formats": ["ply"] },
+        "rawPointCloud": { "support": "native", "formats": ["sensor_msgs/PointCloud2", "ply"] },
+        "trajectory": { "support": "passthrough", "formats": ["nav_msgs/Path"] },
+        "rgb": { "support": "passthrough", "formats": ["sensor_msgs/Image"] }
+      },
+      "live": {
+        "profiles": ["neural", "navigation"],
+        "transports": ["ros_topic"],
+        "inboundChannels": ["trajectory", "live_point_cloud", "rgb_frame", "playback_current_scan_world"],
+        "outboundChannels": ["nav_goal", "initial_pose", "camera_pose"],
+        "canonicalContract": "/contracts/lingbot-map-ros2-live.live-contract.json",
+        "notes": "Matches the HikRobot + LingBot command.txt live stack and exposes generated PLY scene assets through the WebUI dev server."
+      },
+      "navigation": {
+        "publishGoal": true,
+        "publishInitialPose": true,
+        "publishCameraPose": true
+      },
+      "sceneManifest": {
+        "produces": true,
+        "producerScript": "CVPR/HMR3D/nuc/scripts/sync_gs_console_monitor_assets.py"
+      }
+    },
+    {
+      "adapterId": "citygaussian_import",
+      "displayName": "CityGaussian Importer",
+      "sourceKind": "citygaussian",
+      "integrationMode": "scene-pack",
+      "artifacts": {
+        "gaussian": { "support": "native", "formats": ["gs-ply", "splat", "spz", "gs-chunks"] },
+        "mesh": { "support": "native", "formats": ["ply", "glb"] },
+        "occupancy": { "support": "derived", "formats": ["ply"] },
+        "rawPointCloud": { "support": "fallback", "formats": ["ply", "pcd"] }
+      },
+      "live": {
+        "profiles": [],
+        "transports": [],
+        "inboundChannels": [],
+        "outboundChannels": [],
+        "canonicalContract": null
+      },
+      "navigation": {
+        "publishGoal": false,
+        "publishInitialPose": false,
+        "publishCameraPose": false
+      },
+      "sceneManifest": {
+        "produces": true,
+        "producerScript": "scripts/import_citygaussian_scene.py"
+      }
+    },
+    {
+      "adapterId": "sgsslam_import",
+      "displayName": "SGS-SLAM Importer",
+      "sourceKind": "sgsslam",
+      "integrationMode": "scene-pack",
+      "artifacts": {
+        "gaussian": { "support": "native", "formats": ["gs-ply", "spz", "gs-chunks"] },
+        "occupancy": { "support": "fallback", "formats": ["ply"] },
+        "rawPointCloud": { "support": "derived", "formats": ["ply"] },
+        "trajectory": { "support": "derived", "formats": ["pose-log"] },
+        "rgb": { "support": "derived", "formats": ["gpu_input_root sequence"] }
+      },
+      "live": {
+        "profiles": [],
+        "transports": [],
+        "inboundChannels": [],
+        "outboundChannels": [],
+        "canonicalContract": null
+      },
+      "navigation": {
+        "publishGoal": false,
+        "publishInitialPose": false,
+        "publishCameraPose": false
+      },
+      "sceneManifest": {
+        "produces": true,
+        "producerScript": "scripts/import_sgsslam_scene.py"
+      }
+    },
+    {
+      "adapterId": "lingbot_map_viewer",
+      "displayName": "LingBot-Map Viser Baseline",
+      "sourceKind": "lingbot_map",
+      "integrationMode": "importer-only",
+      "artifacts": {
+        "gaussian": { "support": "none" },
+        "mesh": { "support": "derived", "formats": ["glb"], "notes": "Can be exported from LingBot-Map predictions through its GLB export utility." },
+        "rawPointCloud": { "support": "native", "formats": ["viser point cloud", "ply"] },
+        "trajectory": { "support": "native", "formats": ["viser camera frustums"] },
+        "rgb": { "support": "passthrough", "formats": ["image folder", "video frames"] },
+        "depth": { "support": "derived", "formats": ["dense depth prediction"] },
+        "externalViewer": { "support": "native", "formats": ["viser-http"] }
+      },
+      "live": {
+        "profiles": ["external-viewer"],
+        "transports": ["http"],
+        "inboundChannels": ["external_viewer"],
+        "outboundChannels": [],
+        "canonicalContract": "/contracts/lingbot-map.live-contract.json",
+        "notes": "LingBot-Map runs its own viser server; this UI links to it and can later ingest exported GLB/PLY scene packs."
+      },
+      "navigation": {
+        "publishGoal": false,
+        "publishInitialPose": false,
+        "publishCameraPose": false
+      },
+      "sceneManifest": {
+        "produces": true,
+        "producerScript": null,
+        "notes": "Use examples/web-ui/public/scenes/lingbot-map-viewer/manifest.json for the external viewer baseline."
+      }
+    },
+    {
+      "adapterId": "isaac_gaussian_online",
+      "displayName": "Isaac Gaussian Online Bridge",
+      "sourceKind": "isaac_gaussian_online",
+      "integrationMode": "hybrid",
+      "artifacts": {
+        "trajectory": { "support": "native", "formats": ["pose3d-json"] },
+        "rawPointCloud": { "support": "native", "formats": ["pointcloud-json"] },
+        "occupancy": { "support": "derived", "formats": ["pointcloud-json"] },
+        "rgb": { "support": "native", "formats": ["jpeg-http"] },
+        "depth": { "support": "native", "formats": ["jpeg-http"] },
+        "externalViewer": { "support": "native", "formats": ["http-mjpeg"] }
+      },
+      "live": {
+        "profiles": ["neural", "external-viewer", "navigation"],
+        "transports": ["http"],
+        "inboundChannels": ["robot_pose", "trajectory", "live_point_cloud", "rgb_frame", "depth_frame", "external_viewer"],
+        "outboundChannels": ["camera_pose"],
+        "canonicalContract": "/contracts/isaac-gaussian-online.live-contract.json",
+        "notes": "Isaac publishes pose, an accumulated live point cloud, and camera products into a standalone HTTP bridge that can optionally forward camera poses to a Gaussian renderer."
+      },
+      "navigation": {
+        "publishGoal": false,
+        "publishInitialPose": false,
+        "publishCameraPose": true
+      },
+      "sceneManifest": {
+        "produces": true,
+        "producerScript": "scripts/run_isaac_gaussian_online_demo.py"
+      }
+    }
+  ]
+}
