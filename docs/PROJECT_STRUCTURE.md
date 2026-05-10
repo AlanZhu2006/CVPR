@@ -14,6 +14,7 @@ line**.
 | `scripts/runbooks/` | Short executable command templates for the two maintained paths. |
 | `HMR3D/nuc/scripts/` | Jetson/live capture, LingBot export, cuVSLAM, viewer, and conversion scripts. |
 | `HMR3D/nuc/src/nuc_runtime/` | Runtime support code for live tracking, dense workers, fusion, Gaussian helpers, and policies. |
+| `docs/REALTIME_GAUSSIAN_PLAN.md` | Merged older realtime Gaussian / HMR3D long-memory plan. |
 | `third_party_research/` | External research systems: LingBot-Map, GenWildSplat, SplaTAM. |
 | `cuVSLAM/` | Local cuVSLAM source/checkout used for the edge tracking path. |
 

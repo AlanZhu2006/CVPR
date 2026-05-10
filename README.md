@@ -97,6 +97,8 @@ Important paths:
   live HikRobot/cuVSLAM/LingBot path
 - [`docs/EXPERIMENT_SUMMARY.md`](docs/EXPERIMENT_SUMMARY.md): the ablation
   results to cite in slides/report
+- [`docs/REALTIME_GAUSSIAN_PLAN.md`](docs/REALTIME_GAUSSIAN_PLAN.md): merged
+  realtime Gaussian / long-memory line from the older realtime branch
 - [`GS_Console/README.md`](GS_Console/README.md): WebUI, contracts, playback,
   and live inspection console
 
